@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC EZSP NCP"
+    config ZHAC_EZSP_UART_TX_GPIO
+        int "EZSP UART TX GPIO pin"
+        default 26
+        help
+            GPIO pin connected to EFR32 NCP UART RX (host TX → NCP RX).
+            Default IO26 per UART expansion allocation in GPIO doc.
+
+    config ZHAC_EZSP_UART_RX_GPIO
+        int "EZSP UART RX GPIO pin"
+        default 27
+        help
+            GPIO pin connected to EFR32 NCP UART TX (NCP TX → host RX).
+            Default IO27 per UART expansion allocation in GPIO doc.
+
+    config ZHAC_EZSP_UART_RST_GPIO
+        int "EZSP Reset GPIO pin"
+        default 28
+        help
+            GPIO pin connected to EFR32 NCP nRESET.
+            Default IO28 (shared reset line).
+endmenu

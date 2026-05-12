@@ -1,0 +1,569 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// lua_scheduler.c — TaskLua + resume queue + timer pool.
+//
+// Single-threaded: TaskLua is the only task that ever touches g_L.
+// External code reaches Lua by pushing a ResumeMsg onto s_resume_q;
+// the scheduler dequeues, resumes the target coroutine, and on
+// yield/finish updates the registry-held reference.
+//
+// Sleep is implemented via `zhac.sleep(ms)` → lua_yield + esp_timer →
+// queue push on fire. The VM sees a plain yield/resume; the caller
+// never blocks outside Lua.
+
+#include "sdkconfig.h"
+
+#if CONFIG_LUA_ENGINE_ENABLED
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+extern "C" {
+#include "lua_alloc.h"
+#include "lua_engine.h"
+#include "lua_engine_scripts.h"
+#include "lua_internal.h"
+#include "lua_scheduler.h"
+}
+#include "metrics/metrics_macros.h"
+
+static const char* TAG = "lua_sched";
+
+// ── CPU runaway guard (LUA-F1) ────────────────────────────────────────
+// Single-threaded TaskLua ⇒ one tight loop wedges every coroutine and
+// the event bridge. We arm a count hook before each lua_resume; the
+// hook compares esp_timer_get_time() against a deadline and raises a
+// Lua error when the deadline passes. The script's per-resume budget
+// is bounded by LUA_RESUME_DEADLINE_US — generous enough to allow real
+// work, tight enough that a misbehaving handler cannot starve other
+// coroutines for more than ~50 ms.
+static constexpr int64_t LUA_RESUME_DEADLINE_US = 50 * 1000;
+static constexpr int     LUA_RESUME_HOOK_COUNT  = 1000;
+static int64_t           s_resume_deadline_us   = 0;
+
+static void lua_resume_count_hook(lua_State* L, lua_Debug*) {
+    if (esp_timer_get_time() < s_resume_deadline_us) return;
+    luaL_error(L, "lua_engine: resume exceeded %lld us budget",
+               (long long)LUA_RESUME_DEADLINE_US);
+}
+
+static void arm_resume_deadline(lua_State* co) {
+    s_resume_deadline_us = esp_timer_get_time() + LUA_RESUME_DEADLINE_US;
+    lua_sethook(co, lua_resume_count_hook,
+                LUA_MASKCOUNT, LUA_RESUME_HOOK_COUNT);
+}
+
+// ── Timer pool ────────────────────────────────────────────────────────
+typedef struct {
+    esp_timer_handle_t handle;
+    int                coroutine_ref;   // -1 = free
+    bool               in_use;
+} TimerSlot;
+
+static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
+
+// ── Resume queue ──────────────────────────────────────────────────────
+//
+// Two message kinds share one queue:
+//  - MSG_RESUME: resume an existing coroutine by registry ref.
+//  - MSG_EVENT:  iterate a REG_ON_* table and spawn a coroutine per
+//                handler, passing unpacked event fields.
+enum LuaMsgKind : uint8_t {
+    MSG_RESUME    = 0,
+    MSG_EVENT     = 1,
+    MSG_RUN_NAMED = 2,
+};
+
+enum LuaEventKind : uint8_t {
+    LUA_EVT_BOOT = 0,
+    LUA_EVT_ATTR = 1,
+    LUA_EVT_MQTT = 2,
+    LUA_EVT_RAW  = 3,   // ZCL_RAW — frame ZHC didn't decode
+};
+
+typedef struct {
+    int coroutine_ref;
+    int argc;
+    int argv[4];
+} ResumeArgs;
+
+typedef struct {
+    LuaEventKind kind;
+    uint8_t      payload[96];   // mirrors EventBus Event::data layout
+} EventArgs;
+
+typedef struct {
+    char     name[32];            // script identifier (no extension)
+    char     value[64];           // stringified trigger value; "" when unused
+    char     key[20];             // attr name; "" for non-attr triggers
+    char     str_val[32];         // raw VAL_STR value; "" otherwise
+    uint64_t ieee;                // source device IEEE; 0 when absent
+    uint16_t cluster;             // ZCL cluster id; 0 when absent
+    uint16_t attr_id;             // ZCL attribute id; 0 when absent
+    uint8_t  val_type;            // ValType enum
+    int32_t  int_val;             // raw VAL_INT/BOOL value
+} RunNamedArgs;
+
+typedef struct {
+    LuaMsgKind kind;
+    union {
+        ResumeArgs   resume;
+        EventArgs    event;
+        RunNamedArgs named;
+    };
+} LuaMsg;
+
+static QueueHandle_t s_resume_q;
+
+// ── Counters (published via metrics + public API) ─────────────────────
+static std::atomic<std::uint_fast16_t> s_live_coroutines;
+static std::atomic<std::uint_fast32_t> s_error_count;
+static std::atomic<std::uint_fast32_t> s_yield_count;
+
+extern "C" void lua_scheduler_coroutine_enter(void) {
+    const uint32_t n = s_live_coroutines.fetch_add(1) + 1;
+    _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)n);
+}
+
+extern "C" void lua_scheduler_coroutine_exit(void)  {
+    const uint32_t n = s_live_coroutines.fetch_sub(1) - 1;
+    _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)n);
+    // Also sample heap usage on every exit — cheap and captures the
+    // common "script ran, freed everything" signal.
+    _METRIC_VALUE(METRIC_LUA_HEAP_USED_BYTES, (int64_t)lua_engine_heap_used_bytes());
+    _METRIC_VALUE(METRIC_LUA_HEAP_PEAK_BYTES, (int64_t)lua_engine_heap_peak_bytes());
+}
+
+extern "C" uint16_t lua_scheduler_live_count(void)  { return (uint16_t)s_live_coroutines.load(); }
+extern "C" uint32_t lua_scheduler_error_count(void) { return (uint32_t)s_error_count.load(); }
+extern "C" uint32_t lua_scheduler_yield_count(void) { return (uint32_t)s_yield_count.load(); }
+
+extern "C" void lua_scheduler_error_bump(void) {
+    s_error_count.fetch_add(1);
+    _METRIC_COUNTER_INC(METRIC_LUA_ERRORS_TOTAL, 1);
+}
+extern "C" void lua_scheduler_yield_bump(void) {
+    s_yield_count.fetch_add(1);
+    _METRIC_COUNTER_INC(METRIC_LUA_YIELDS_TOTAL, 1);
+}
+
+// ── Timer callback → resume queue push ────────────────────────────────
+static void on_timer_fire(void* arg) {
+    TimerSlot* slot = (TimerSlot*)arg;
+    if (!slot || !slot->in_use) return;
+    LuaMsg m = {};
+    m.kind                = MSG_RESUME;
+    m.resume.coroutine_ref = slot->coroutine_ref;
+    slot->in_use          = false;
+    slot->coroutine_ref   = -1;
+    BaseType_t hp_woken   = pdFALSE;
+    xQueueSendFromISR(s_resume_q, &m, &hp_woken);
+    if (hp_woken) portYIELD_FROM_ISR();
+}
+
+static TimerSlot* slot_acquire(int coroutine_ref) {
+    for (size_t i = 0; i < CONFIG_LUA_ENGINE_TIMER_POOL; ++i) {
+        if (!s_timer_pool[i].in_use) {
+            s_timer_pool[i].in_use        = true;
+            s_timer_pool[i].coroutine_ref = coroutine_ref;
+            if (!s_timer_pool[i].handle) {
+                const esp_timer_create_args_t args = {
+                    .callback         = on_timer_fire,
+                    .arg              = &s_timer_pool[i],
+                    .dispatch_method  = ESP_TIMER_TASK,
+                    .name             = "lua_sleep",
+                    .skip_unhandled_events = false,
+                };
+                if (esp_timer_create(&args, &s_timer_pool[i].handle) != ESP_OK) {
+                    s_timer_pool[i].in_use = false;
+                    return NULL;
+                }
+            }
+            return &s_timer_pool[i];
+        }
+    }
+    return NULL;
+}
+
+// Exposed to zhac.sleep so the native binding can schedule without
+// looking at scheduler internals.
+extern "C" bool lua_scheduler_sleep(int coroutine_ref, uint32_t delay_ms) {
+    TimerSlot* s = slot_acquire(coroutine_ref);
+    if (!s) return false;
+    esp_timer_start_once(s->handle, (uint64_t)delay_ms * 1000ULL);
+    return true;
+}
+
+// Exposed to anyone wanting to push a resume from outside TaskLua.
+// Safe from ISR or normal task.
+extern "C" bool lua_scheduler_push_resume(int coroutine_ref) {
+    LuaMsg m = {};
+    m.kind                 = MSG_RESUME;
+    m.resume.coroutine_ref = coroutine_ref;
+    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+    return ok;
+}
+
+// Public one-arg entry for clients that don't need trigger context
+// (e.g. the UI Run button). Declared in `lua_engine_scripts.h`.
+extern "C" bool lua_engine_run_script(const char* name) {
+    return lua_scheduler_push_run_named(name, nullptr);
+}
+
+extern "C" bool lua_scheduler_push_run_named(const char* name,
+                                               const LuaScriptInvokeArgs* args) {
+    if (!name) return false;
+    LuaMsg m = {};
+    m.kind = MSG_RUN_NAMED;
+    std::strncpy(m.named.name, name, sizeof(m.named.name) - 1);
+    if (args) {
+        if (args->value)
+            std::strncpy(m.named.value, args->value,
+                         sizeof(m.named.value) - 1);
+        if (args->key)
+            std::strncpy(m.named.key, args->key,
+                         sizeof(m.named.key) - 1);
+        if (args->str_val)
+            std::strncpy(m.named.str_val, args->str_val,
+                         sizeof(m.named.str_val) - 1);
+        m.named.ieee     = args->ieee;
+        m.named.cluster  = args->cluster;
+        m.named.attr_id  = args->attr_id;
+        m.named.val_type = args->val_type;
+        m.named.int_val  = args->int_val;
+    }
+    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+    return ok;
+}
+
+extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
+                                           const void* payload_96) {
+    LuaMsg m = {};
+    m.kind = MSG_EVENT;
+    m.event.kind = (LuaEventKind)event_kind;
+    if (payload_96) {
+        memcpy(m.event.payload, payload_96, 96);
+    }
+    // From EventBus context — the event_bus task isn't an ISR, so a
+    // normal send is correct. Use 0 timeout; if TaskLua is behind we
+    // drop the event rather than blocking the publisher.
+    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+    return ok;
+}
+
+// ── Coroutine driver ──────────────────────────────────────────────────
+static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
+    lua_rawgeti(L, LUA_REGISTRYINDEX, r->coroutine_ref);
+    lua_State* co = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    if (!co) {
+        ESP_LOGW(TAG, "resume: ref %d is not a thread", r->coroutine_ref);
+        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
+        return;
+    }
+
+    for (int i = 0; i < r->argc; ++i) lua_pushinteger(co, r->argv[i]);
+
+    int nres = 0;
+    arm_resume_deadline(co);
+    const int status = lua_resume(co, L, r->argc, &nres);
+
+    if (status == LUA_OK) {
+        lua_pop(co, nres);
+        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
+        lua_scheduler_coroutine_exit();
+    } else if (status == LUA_YIELD) {
+        lua_pop(co, nres);
+        lua_scheduler_yield_bump();
+    } else {
+        const char* err = lua_tostring(co, -1);
+        ESP_LOGE(TAG, "coroutine error: %s", err ? err : "(no message)");
+        lua_pop(co, 1);
+        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
+        lua_scheduler_coroutine_exit();
+        lua_scheduler_error_bump();
+    }
+}
+
+// Marshal event fields onto a coroutine's stack. Returns argc.
+static int push_event_args(lua_State* co, const EventArgs* e) {
+    switch (e->kind) {
+        case LUA_EVT_BOOT:
+            return 0;
+        case LUA_EVT_ATTR: {
+            // ZclAttrEvent layout (packed, 96 B): ieee(8), nwk(2), ep(1),
+            // val_type(1), cluster(2), attr_id(2), key[20], union{int32
+            // or str[32]}, pad.
+            const uint8_t* p = e->payload;
+            uint64_t ieee;    memcpy(&ieee, p + 0, 8);
+            uint16_t cluster; memcpy(&cluster, p + 12, 2);
+            uint16_t attr_id; memcpy(&attr_id, p + 14, 2);
+            const char* key = (const char*)(p + 16);
+            const uint8_t val_type = p[11];
+            // val_type: 0=INT, 1=BOOL, 2=STR (see attr_keys.h).
+            char ieee_hex[20];
+            snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
+                     (unsigned long long)ieee);
+            lua_pushstring(co, ieee_hex);
+            lua_pushstring(co, key);
+            if (val_type == 2) {
+                lua_pushstring(co, (const char*)(p + 36));
+            } else if (val_type == 1) {
+                int32_t v; memcpy(&v, p + 36, 4);
+                lua_pushboolean(co, v != 0);
+            } else {
+                int32_t v; memcpy(&v, p + 36, 4);
+                lua_pushinteger(co, v);
+            }
+            lua_pushinteger(co, cluster);
+            lua_pushinteger(co, attr_id);
+            return 5;
+        }
+        case LUA_EVT_MQTT: {
+            // MqttMsgEvent: topic[64], payload[32].
+            const char* topic   = (const char*)(e->payload + 0);
+            const char* payload = (const char*)(e->payload + 64);
+            lua_pushstring(co, topic);
+            lua_pushstring(co, payload);
+            return 2;
+        }
+        case LUA_EVT_RAW: {
+            // ZclRawEvent (packed, 96 B): ieee(8), nwk(2), ep(1),
+            // command(1), cluster(2), payload_len(1), _pad(1),
+            // payload_hex[80].
+            const uint8_t* p = e->payload;
+            uint64_t ieee;    memcpy(&ieee,    p + 0,  8);
+            uint16_t nwk;     memcpy(&nwk,     p + 8,  2);
+            const uint8_t  ep      = p[10];
+            const uint8_t  command = p[11];
+            uint16_t cluster; memcpy(&cluster, p + 12, 2);
+            const uint8_t  plen    = p[14];
+            const char*    hex     = (const char*)(p + 16);
+            char ieee_hex[20];
+            snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
+                     (unsigned long long)ieee);
+            // Single table arg — too many fields for positional. Lua
+            // handler reads `ev.cluster`, `ev.hex`, etc.
+            lua_newtable(co);
+            lua_pushstring(co, ieee_hex);   lua_setfield(co, -2, "ieee");
+            lua_pushinteger(co, nwk);       lua_setfield(co, -2, "nwk");
+            lua_pushinteger(co, ep);        lua_setfield(co, -2, "ep");
+            lua_pushinteger(co, cluster);   lua_setfield(co, -2, "cluster");
+            lua_pushinteger(co, command);   lua_setfield(co, -2, "command");
+            lua_pushinteger(co, plen);      lua_setfield(co, -2, "len");
+            lua_pushstring(co, hex);        lua_setfield(co, -2, "hex");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static const char* reg_key_for(LuaEventKind k) {
+    switch (k) {
+        case LUA_EVT_BOOT: return "zhac_on_boot_refs";
+        case LUA_EVT_ATTR: return "zhac_on_attr_refs";
+        case LUA_EVT_MQTT: return "zhac_on_mqtt_refs";
+        case LUA_EVT_RAW:  return "zhac_on_raw_refs";
+    }
+    return NULL;
+}
+
+// Iterate the registered handler table for this event, spawning one
+// coroutine per handler with event-specific args pushed.
+static void dispatch_event(lua_State* L, const EventArgs* e) {
+    const char* key = reg_key_for(e->kind);
+    if (!key) return;
+
+    lua_getfield(L, LUA_REGISTRYINDEX, key);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    const lua_Integer n = luaL_len(L, -1);
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_geti(L, -1, i);    // push handler fn
+        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
+
+        lua_State* co = lua_newthread(L);
+        // Stack now: [..., handlers_tbl, fn, co]. Reorder to
+        // [handlers_tbl, co, fn] then xmove fn onto co.
+        lua_insert(L, -2);              // [handlers_tbl, co, fn]
+        lua_xmove(L, co, 1);            // fn → co. L: [handlers_tbl, co]
+
+        const int argc = push_event_args(co, e);
+
+        // Hold a ref so the thread isn't GC'd while we resume.
+        lua_pushvalue(L, -1);           // duplicate thread for ref
+        const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        if (ref == LUA_NOREF) {
+            lua_pop(L, 1);              // pop thread
+            continue;
+        }
+
+        lua_scheduler_coroutine_enter();
+
+        // Run the coroutine inline. Args are already on co; pass argc
+        // as nargs so Lua hands them to the function.
+        int nres = 0;
+        arm_resume_deadline(co);
+        const int status = lua_resume(co, L, argc, &nres);
+        if (status == LUA_YIELD) {
+            lua_pop(co, nres);
+            lua_scheduler_yield_bump();
+            // Ref stays live; the yield path (zhac.sleep etc.) is
+            // responsible for pushing a resume when ready.
+        } else {
+            if (status != LUA_OK) {
+                const char* err = lua_tostring(co, -1);
+                ESP_LOGE(TAG, "handler error: %s", err ? err : "(no message)");
+                lua_scheduler_error_bump();
+            }
+            lua_pop(co, (status == LUA_OK) ? nres : 1);
+            luaL_unref(L, LUA_REGISTRYINDEX, ref);
+            lua_scheduler_coroutine_exit();
+        }
+        lua_pop(L, 1);                   // pop thread from L
+    }
+    lua_pop(L, 1);                       // handler table
+}
+
+// Load a named script from the SPIFFS cache, compile as text, run it as
+// a fresh coroutine. The coroutine always receives a single table arg
+// with the trigger context ({value, key, ieee, cluster, attr_id,
+// val_type, int_val, str_val}); fields are zero / "" for non-device
+// triggers. Returns after the coroutine either yields or terminates.
+static void run_named_script(lua_State* L, const RunNamedArgs* r) {
+    // 8 KB script source scratch lives in PSRAM. Lazy one-shot init.
+    constexpr size_t kBufSz = 8192;
+    static char* buf = nullptr;
+    if (!buf) {
+        buf = static_cast<char*>(
+            heap_caps_malloc(kBufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!buf) buf = static_cast<char*>(heap_caps_malloc(kBufSz, MALLOC_CAP_8BIT));
+        if (!buf) { ESP_LOGE(TAG, "run_named: buf alloc failed"); return; }
+    }
+    const int n = lua_script_cache_read(r->name, buf, kBufSz);
+    if (n < 0) {
+        ESP_LOGW(TAG, "script.run '%s' — script not found in cache", r->name);
+        return;
+    }
+    if (luaL_loadbufferx(L, buf, (size_t)n, r->name, "t") != LUA_OK) {
+        ESP_LOGE(TAG, "script.run '%s' compile error: %s",
+                 r->name, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return;
+    }
+    // Stack: [fn]. Wrap in a coroutine so yields (zhac.sleep etc.)
+    // work and the caller doesn't block TaskLua.
+    lua_State* co = lua_newthread(L);                 // [fn, co]
+    lua_insert(L, -2);                                 // [co, fn]
+    lua_xmove(L, co, 1);                               // fn → co. L: [co]
+
+    // Push a single event-context table as the call argument. Callers
+    // that only care about the stringified value still get it via
+    // `ev.value`; `ON device DO script.run "..."` handlers can inspect
+    // `ev.key` / `ev.int_val` etc. to route on the firing attr.
+    lua_newtable(co);
+    lua_pushstring(co, r->value);       lua_setfield(co, -2, "value");
+    lua_pushstring(co, r->key);         lua_setfield(co, -2, "key");
+    lua_pushstring(co, r->str_val);     lua_setfield(co, -2, "str_val");
+    lua_pushinteger(co, (lua_Integer)r->ieee);     lua_setfield(co, -2, "ieee");
+    lua_pushinteger(co, (lua_Integer)r->cluster);  lua_setfield(co, -2, "cluster");
+    lua_pushinteger(co, (lua_Integer)r->attr_id);  lua_setfield(co, -2, "attr_id");
+    lua_pushinteger(co, (lua_Integer)r->val_type); lua_setfield(co, -2, "val_type");
+    lua_pushinteger(co, (lua_Integer)r->int_val);  lua_setfield(co, -2, "int_val");
+    const int argc = 1;
+
+    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);    // consumes co
+    if (ref == LUA_NOREF) return;
+    lua_scheduler_coroutine_enter();
+
+    int nres = 0;
+    arm_resume_deadline(co);
+    const int status = lua_resume(co, L, argc, &nres);
+    if (status == LUA_YIELD) {
+        lua_pop(co, nres);
+        lua_scheduler_yield_bump();
+    } else {
+        if (status != LUA_OK) {
+            const char* err = lua_tostring(co, -1);
+            ESP_LOGE(TAG, "lua.run '%s' error: %s",
+                     r->name, err ? err : "(no message)");
+            lua_scheduler_error_bump();
+        }
+        lua_pop(co, (status == LUA_OK) ? nres : 1);
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        lua_scheduler_coroutine_exit();
+    }
+}
+
+static void task_lua(void* arg) {
+    lua_State* L = (lua_State*)arg;
+    ESP_LOGI(TAG, "TaskLua started");
+    LuaMsg m;
+    for (;;) {
+        if (xQueueReceive(s_resume_q, &m, portMAX_DELAY) != pdTRUE) continue;
+        if (m.kind == MSG_RESUME) {
+            resume_coroutine(L, &m.resume);
+        } else if (m.kind == MSG_EVENT) {
+            dispatch_event(L, &m.event);
+        } else if (m.kind == MSG_RUN_NAMED) {
+            run_named_script(L, &m.named);
+        }
+    }
+}
+
+// Spawn a coroutine from a Lua function on top of L's stack. Consumes
+// the function value. Returns the registry ref, or LUA_NOREF on OOM.
+extern "C" int lua_scheduler_spawn(lua_State* L) {
+    if (!lua_isfunction(L, -1)) return LUA_NOREF;
+
+    lua_State* co = lua_newthread(L);
+    // Stack now: [..., function, thread]. Move the function to the
+    // new coroutine's stack.
+    lua_pushvalue(L, -2);      // copy function
+    lua_xmove(L, co, 1);       // move to coroutine
+    lua_remove(L, -2);         // drop the original function
+
+    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    if (ref == LUA_NOREF) return LUA_NOREF;
+
+    lua_scheduler_coroutine_enter();
+    lua_scheduler_push_resume(ref);
+    return ref;
+}
+
+extern "C" bool lua_engine_scheduler_start(lua_State* L) {
+    s_resume_q = xQueueCreate(CONFIG_LUA_ENGINE_RESUME_QUEUE_DEPTH,
+                               sizeof(LuaMsg));
+    if (!s_resume_q) {
+        ESP_LOGE(TAG, "resume queue create failed");
+        return false;
+    }
+
+    BaseType_t ok = xTaskCreate(task_lua, "TaskLua",
+                                 CONFIG_LUA_ENGINE_TASK_STACK_BYTES,
+                                 L,
+                                 CONFIG_LUA_ENGINE_TASK_PRIORITY,
+                                 NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "TaskLua create failed");
+        vQueueDelete(s_resume_q);
+        s_resume_q = NULL;
+        return false;
+    }
+    return true;
+}
+
+#endif

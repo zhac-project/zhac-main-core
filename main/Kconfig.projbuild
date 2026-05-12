@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "ZHAC Zigbee NCP Backend"
+    choice ZHAC_NCP_BACKEND
+        prompt "NCP Protocol"
+        default ZHAC_NCP_ZNP
+
+        config ZHAC_NCP_ZNP
+            bool "TI Z-Stack NCP (ZNP/MT protocol)"
+            help
+                CC2652/CC2530 coprocessors using TI's MT serial protocol.
+
+        config ZHAC_NCP_EZSP
+            bool "Silicon Labs EmberZNet (EZSP/ASH protocol)"
+            help
+                EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH framing.
+
+        config ZHAC_NCP_C6
+            bool "Espressif ESP32-C6 (ZNCP / esp-zigbee-sdk)"
+            help
+                ESP32-C6 / ESP32-H2 acting as a Zigbee Network Co-processor
+                running the upstream `esp_zigbee_ncp` example firmware.
+                See docs/plans/2026-04-25-c6-coprocessor.md.
+    endchoice
+
+    menu "ZNP GPIO Pins (CC2652)"
+        depends on ZHAC_NCP_ZNP
+
+        config ZHAC_ZNP_UART_TX_GPIO
+            int "ZNP UART TX GPIO"
+            default 16
+
+        config ZHAC_ZNP_UART_RX_GPIO
+            int "ZNP UART RX GPIO"
+            default 17
+
+        config ZHAC_ZNP_UART_RST_GPIO
+            int "ZNP Reset GPIO"
+            default 28
+
+        config ZHAC_ZNP_UART_BSL_GPIO
+            int "ZNP BSL GPIO"
+            default 29
+    endmenu
+
+    menu "C6 GPIO Pins (ESP32-C6 ZNCP)"
+        depends on ZHAC_NCP_C6
+
+        config ZHAC_C6_UART_TX_GPIO
+            int "C6 UART TX GPIO (P4 → C6)"
+            default 16
+
+        config ZHAC_C6_UART_RX_GPIO
+            int "C6 UART RX GPIO (C6 → P4)"
+            default 17
+
+        config ZHAC_C6_UART_RST_GPIO
+            int "C6 Reset GPIO (drives EN/RESET on C6)"
+            default 28
+
+        config ZHAC_C6_UART_BAUD
+            int "C6 UART baud rate"
+            default 460800
+            help
+                Default 460800 baud matches Espressif's `esp_zigbee_ncp`
+                example. Drop to 115200 if signal integrity on the wire
+                between the two boards is borderline.
+    endmenu
+endmenu
+
+menu "ZHAC HAP Diagnostics"
+    config HAP_BENCHMARK
+        bool "Enable HAP throughput benchmark task"
+        default n
+        help
+            When enabled, P4 boots a one-shot task that sends 1000 small
+            HEARTBEAT frames over HAP and logs the achieved frames/sec.
+            Used to verify v4 two-stage SPI throughput. Disable in production.
+endmenu
+
+menu "ZHAC P4 Buttons"
+    config ZHAC_P4_RESET_BTN_GPIO
+        int "Zigbee reset button GPIO (long-press 5s = factory reset)"
+        default 35
+        help
+          GPIO 35 is the BOOT button on the ESP32-P4 dev kit. The button is
+          also a strapping pin (LOW at boot enters flash mode); task_buttons
+          disables the button if it reads LOW at task startup so accidental
+          factory reset during flashing is impossible.
+          Per docs/esp32_p4_gpio_allocation.md §6.
+
+    config ZHAC_P4_JOIN_BTN_GPIO
+        int "Permit-join button GPIO (short-press = open network 254s)"
+        default 12
+        help
+          Per docs/esp32_p4_gpio_allocation.md §6.
+endmenu

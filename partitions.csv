@@ -1,0 +1,12 @@
+# Name,         Type,  SubType,  Offset,    Size
+nvs,            data,  nvs,      0x9000,    32K
+otadata,        data,  ota,      ,   8K
+ota_0,          app,   ota_0,    ,   4M
+ota_1,          app,   ota_1,    ,  4M
+zap_snap_A,     data,  0x40,     ,  1M
+zap_snap_B,     data,  0x41,     ,  1M
+zap_journal,    data,  0x42,     ,  1M
+zap_rules,      data,  0x43,     ,  512K
+coredump,       data,  coredump, ,  64K
+scripts,        data,  spiffs,   ,  4M
+# ~0.31M still available

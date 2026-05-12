@@ -1,0 +1,48 @@
+zhac-main-core — ZHAC ESP32-P4 firmware
+Copyright © 2025–2026 Evgenij Cjura and project contributors.
+
+Licensed under the GNU Affero General Public License v3 or later.
+See `LICENSE` and `LICENSES/AGPL-3.0-or-later.txt`.
+
+================================================================================
+Trademarks
+================================================================================
+
+"ZHAC" and any associated logos, product names, and marks are the
+exclusive property of the project maintainer. The AGPL license
+governing this firmware DOES NOT grant any right to use these names
+or marks. Forks and derivative works must choose a different
+product name and branding.
+
+================================================================================
+Third-party components vendored in this repository
+================================================================================
+
+1. lua-cjson — components/lua_cjson/
+   Copyright © 2010-2012 Mark Pulford
+   Licensed under the MIT License.
+   Upstream: https://github.com/openresty/lua-cjson (v2.1.0.14)
+   See components/lua_cjson/src/LICENSE
+
+================================================================================
+Third-party dependencies pulled at build time (not vendored)
+================================================================================
+
+- ESP-IDF v6.0 — Apache License 2.0 (Espressif Systems).
+- FreeRTOS — MIT License (Amazon Web Services, Inc.).
+- PUC-Lua 5.5 — MIT License (Lua.org, PUC-Rio). Fetched via the ESP
+  Component Registry as `georgik/lua`.
+- zhac-components — mixed Apache-2.0 / AGPL-3.0-or-later
+  (same project, separate repo).
+- embedded-zhc — Apache License 2.0 (same project, separate repo).
+
+================================================================================
+License compatibility
+================================================================================
+
+All linked components — lua-cjson (MIT), ESP-IDF (Apache-2.0),
+FreeRTOS (MIT), Lua (MIT), zhac-components (mixed), embedded-zhc
+(Apache-2.0) — are compatible with AGPL-3.0-or-later for inclusion
+in this firmware's combined binary, which is distributed under
+AGPL-3.0-or-later as a whole. Each upstream component retains its
+own license when used in isolation.

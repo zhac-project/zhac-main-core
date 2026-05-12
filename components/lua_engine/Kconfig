@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+menu "Lua engine"
+
+config LUA_ENGINE_ENABLED
+    bool "Enable Lua scripting engine"
+    default y
+
+config LUA_ENGINE_HEAP_KB
+    int "PSRAM heap budget (KB) for the Lua VM"
+    depends on LUA_ENGINE_ENABLED
+    default 4096
+    range 256 16384
+    help
+        Hard cap on total allocations charged to the Lua allocator.
+        Exceeding this returns NULL from lua_Alloc, which Lua turns
+        into `not enough memory` and unwinds safely.
+
+config LUA_ENGINE_INTERNAL_SMALL_THRESHOLD
+    int "Internal-RAM threshold for small allocations (bytes)"
+    depends on LUA_ENGINE_ENABLED
+    default 512
+    range 64 4096
+    help
+        Allocations smaller than this try internal RAM first (fast
+        path) and fall back to PSRAM on ENOMEM. Larger allocations
+        go straight to PSRAM.
+
+config LUA_ENGINE_MAX_COROUTINES
+    int "Max live coroutines"
+    depends on LUA_ENGINE_ENABLED
+    default 64
+    range 4 256
+
+config LUA_ENGINE_TIMER_POOL
+    int "Pre-allocated one-shot timer pool size"
+    depends on LUA_ENGINE_ENABLED
+    default 16
+    range 4 64
+    help
+        Pool of esp_timer_t instances shared by sleeping coroutines.
+        If exhausted, `zhac.sleep` returns an error rather than
+        allocating.
+
+config LUA_ENGINE_RESUME_QUEUE_DEPTH
+    int "Resume queue depth"
+    depends on LUA_ENGINE_ENABLED
+    default 32
+    range 8 256
+
+config LUA_ENGINE_TASK_STACK_BYTES
+    int "TaskLua stack size (bytes)"
+    depends on LUA_ENGINE_ENABLED
+    default 8192
+    range 4096 32768
+
+config LUA_ENGINE_TASK_PRIORITY
+    int "TaskLua FreeRTOS priority"
+    depends on LUA_ENGINE_ENABLED
+    default 4
+    range 1 20
+
+menu "Curated Lua libraries (preloaded via require)"
+
+config LUA_ENGINE_WITH_CJSON
+    bool "lua-cjson (JSON encode/decode)"
+    depends on LUA_ENGINE_ENABLED
+    default y
+    help
+        Expose openresty/lua-cjson as `require("cjson")`. Vendored
+        under `components/lua_cjson/` (MIT licensed). Provides
+        `cjson.encode` / `cjson.decode`, useful for parsing MQTT
+        payloads or building structured REST responses from scripts.
+
+config LUA_ENGINE_WITH_LPEG
+    bool "LPeg (pattern matching)"
+    depends on LUA_ENGINE_ENABLED
+    default n
+    help
+        Expose lua.org/lpeg as `require("lpeg")`. Expects
+        `luaopen_lpeg` to link.
+
+config LUA_ENGINE_WITH_MINIZ
+    bool "lua-miniz (zlib compress/decompress)"
+    depends on LUA_ENGINE_ENABLED
+    default n
+    help
+        Expose luapower/miniz binding as `require("miniz")`.
+        Expects `luaopen_miniz` to link.
+
+config LUA_ENGINE_CJSON_DECODE_MAX_DEPTH
+    int "cjson.decode max nesting depth"
+    depends on LUA_ENGINE_WITH_CJSON
+    default 64
+    range 4 1000
+    help
+        Hardens against stack blow-ups when decoding attacker-
+        controlled JSON. Applied at module init via
+        `cjson.decode_max_depth()`.
+
+endmenu
+
+endmenu
