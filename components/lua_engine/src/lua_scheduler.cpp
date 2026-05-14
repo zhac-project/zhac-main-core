@@ -300,7 +300,15 @@ static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
 static int push_event_args(lua_State* co, const EventArgs* e) {
     switch (e->kind) {
         case LUA_EVT_BOOT:
-            return 0;
+            // Push an empty table so handlers written as
+            //   function(ev) print(ev.foo) end
+            // get a real first arg and can index it safely (yields nil)
+            // instead of throwing "attempt to index a nil value". The
+            // boot event carries no payload, so the table is empty by
+            // design — handlers wanting boot-specific fields should
+            // expect to find none.
+            lua_newtable(co);
+            return 1;
         case LUA_EVT_ATTR: {
             // ZclAttrEvent layout (packed, 96 B): ieee(8), nwk(2), ep(1),
             // val_type(1), cluster(2), attr_id(2), key[20], union{int32

@@ -122,12 +122,13 @@ extern "C" void app_main() {
     metrics::init();
 
     // Lua engine — the project's sole scripting runtime. init() brings
-    // up the VM + task;
-    // load_all() scans the NVS script cache and spawns one coroutine
-    // per `.lua` entry. No-op on CONFIG_LUA_ENGINE_ENABLED=n.
-    if (lua_engine_init()) {
-        lua_engine_load_all();
-    }
+    // up the VM + task. We DON'T call load_all() here — scripts can
+    // call into hap_session / tg_gw / rule_store / mqtt_gw etc. as
+    // soon as they run, and those subsystems are initialised below.
+    // load_all() therefore runs at the very end of app_main once every
+    // subsystem the script may touch is up. Until then TaskLua is idle
+    // waiting on its resume queue.
+    const bool lua_ready = lua_engine_init();
 
     s_log_queue = xQueueCreate(LOG_QUEUE_DEPTH, sizeof(LogEntry));
     configASSERT(s_log_queue);
@@ -164,6 +165,14 @@ extern "C" void app_main() {
     mqtt_gw_init();
     tg_gw_init();
     hap_slave_init();
+
+    // Subsystems Lua scripts may touch are now up — release the user
+    // scripts. Doing this earlier (right after lua_engine_init) raced
+    // with hap_session_init/etc. and crashed when a script's first API
+    // call hit a NULL mutex.
+    if (lua_ready) {
+        lua_engine_load_all();
+    }
 
     // Alert producer for rule-level errors. Script errors are now
     // surfaced by the Lua scheduler via METRIC_LUA_ERRORS_TOTAL +

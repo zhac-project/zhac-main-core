@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
+#include <ctime>
 
 static const char* TAG = "ezsp_be";
 
@@ -121,11 +122,21 @@ static void on_incoming_message(const EzspFrame& f) {
 
     (void)dst_ep;
 
-    // Update device LQI
+    // Update device LQI + last-seen. Use wall-clock Unix seconds via
+    // time(nullptr) (same source as the ZNP path in zigbee_mgr.cpp).
+    // The old esp_timer_get_time() values are seconds-since-boot
+    // (uptime), not Unix epoch, so the SPA's `Date.now()/1000 -
+    // last_seen` calc treated them as 1970+uptime → 55-year deltas
+    // (the "494079h ago" UI symptom). If SNTP hasn't ticked yet
+    // time() returns a small value — skip the write so the field
+    // doesn't get junk; UI renders "—" instead.
     ZapDevice* dev = pool_find_by_nwk(sender);
     if (dev) {
         dev->link_quality = lqi;
-        dev->last_seen    = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        const time_t now = time(nullptr);
+        if (now > 1577836800) {  // > 2020-01-01 → SNTP plausibly synced
+            dev->last_seen = (uint32_t)now;
+        }
     }
 
     // Route ZCL frame through the ZHC adapter (same as ZNP path). The
