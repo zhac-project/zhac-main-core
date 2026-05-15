@@ -85,7 +85,7 @@ A script's journey, from upload to execution:
 Browser / curl
        │
        ▼  POST /api/scripts/<name>     (raw Lua text)
-S3 REST handler (firmware/s3_core/main/rest_rules.cpp)
+S3 REST handler (firmware/zhac-net-core/main/rest_rules.cpp)
        │  SCRIPT_WRITE HAP frame
        ▼
 P4 hap_dispatch (firmware/p4_core/main/hap_dispatch.cpp)
@@ -729,7 +729,7 @@ boot — the list API stops iterating after 16.
 ## 8. REST endpoints
 
 All endpoints are served by the S3 core and proxied to P4 over HAP.
-Handlers in `firmware/s3_core/main/rest_rules.cpp`. All require the
+Handlers in `firmware/zhac-net-core/main/rest_rules.cpp`. All require the
 `X-Api-Key` token (`REQUIRE_AUTH`).
 
 See `docs/REST_API.md` for the full API surface; the section below

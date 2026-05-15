@@ -932,7 +932,10 @@ static void handle_configure_req(const HapFrame& f) {
     }
     const uint64_t ieee_cp = dev->ieee_addr;
     const uint16_t nwk_cp  = dev->nwk_addr;
-    char model_cp[32], manu_cp[32];
+    // Buffers sized to comfortably exceed ZapDevice::model_id /
+    // manufacturer_name (~34 B each) — anything smaller trips
+    // -Werror=format-truncation.
+    char model_cp[64], manu_cp[64];
     snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
     snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
     zigbee_pool_unlock();
