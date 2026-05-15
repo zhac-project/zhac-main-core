@@ -904,6 +904,44 @@ static void handle_interview_req(const HapFrame& f) {
         ESP_LOGW(TAG, "INTERVIEW_REQ decode failed");
 }
 
+// CONFIGURE_REQ — re-fire `zhac_adapter_configure` for one device WITHOUT
+// redoing the full ZNP interview. Used when a firmware update adds new
+// wiring (read-on-join attrs, new reports, new config_steps) to a def
+// that some paired devices already match — the SPA "Configure" button
+// posts this, P4 walks the pipeline against the cached (model, manuf)
+// from the pool. Payload shape is identical to INTERVIEW_REQ so the
+// same JSON decoder works for both.
+//
+// Releases the pool lock before invoking `zhac_adapter_configure` —
+// the call issues radio frames that can block on AF_DATA_CONFIRM for
+// ~2.5 s; holding the pool mutex would stall every other device
+// dispatching attrs simultaneously.
+static void handle_configure_req(const HapFrame& f) {
+    uint64_t ieee = 0;
+    if (!hap_json_decode_interview_req(f.payload, f.payload_len, &ieee)) {
+        ESP_LOGW(TAG, "CONFIGURE_REQ decode failed");
+        return;
+    }
+    zigbee_pool_lock();
+    const ZapDevice* dev = pool_find_by_ieee(ieee);
+    if (!dev || dev->model_id[0] == '\0') {
+        zigbee_pool_unlock();
+        ESP_LOGW(TAG, "CONFIGURE_REQ ieee=0x%016llx unknown or never interviewed",
+                 (unsigned long long)ieee);
+        return;
+    }
+    const uint64_t ieee_cp = dev->ieee_addr;
+    const uint16_t nwk_cp  = dev->nwk_addr;
+    char model_cp[32], manu_cp[32];
+    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
+    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
+    zigbee_pool_unlock();
+
+    const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp, model_cp, manu_cp);
+    ESP_LOGI(TAG, "CONFIGURE_REQ ieee=0x%016llx model=%s -> %s",
+             (unsigned long long)ieee_cp, model_cp, ok ? "ok" : "fail");
+}
+
 static void handle_device_options_set(const HapFrame& f) {
     uint64_t ieee = 0;
     int32_t occupancy_timeout_s = -1;  // -1 = absent
@@ -1048,6 +1086,7 @@ constexpr HapRow kHapHandlers[] = {
     { HapMsgType::BIND_REQ,             handle_bind_req              },
     { HapMsgType::DEVICE_DELETE,        handle_device_delete         },
     { HapMsgType::INTERVIEW_REQ,        handle_interview_req         },
+    { HapMsgType::CONFIGURE_REQ,        handle_configure_req         },
     { HapMsgType::DEVICE_OPTIONS_SET,   handle_device_options_set    },
     { HapMsgType::ZIGBEE_CFG_SET,       handle_zigbee_cfg_set        },
     { HapMsgType::ZIGBEE_FACTORY_RESET, handle_zigbee_factory_reset_msg },
