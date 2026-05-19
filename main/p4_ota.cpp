@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
@@ -21,9 +22,26 @@ static esp_ota_handle_t        s_ota_handle          = 0;
 static const esp_partition_t*  s_ota_part            = nullptr;
 static uint32_t                s_ota_expected_offset = 0;
 static uint32_t                s_ota_total           = 0;
+// Suppresses duplicate OTA_STATUS frames during a failure cascade.
+// Without this, every mismatched chunk after the first error re-fires
+// send_ota_status(false) — flooding the HAP wire with ~60 frames in a
+// 1-2s window while S3 still has chunks in flight. Reset on chunk-0
+// begin so a fresh OTA retry can report fresh failures.
+static bool                    s_ota_failure_notified = false;
 
 // ── OTA helpers ───────────────────────────────────────────────────────────
 static void send_ota_status(bool ok, uint32_t rcvd, uint32_t total, const char* err_msg) {
+    // Drop duplicate failure notifications. Only the FIRST failure in a
+    // cascade carries useful diagnostic info — subsequent ones are
+    // collateral from chunks still in flight while S3 hasn't yet
+    // noticed the abort. A successful terminal frame always goes
+    // through and clears the flag.
+    if (!ok) {
+        if (s_ota_failure_notified) return;
+        s_ota_failure_notified = true;
+    } else {
+        s_ota_failure_notified = false;
+    }
     HapOtaStatus s{};
     s.ok    = ok;
     s.rcvd  = rcvd;
@@ -33,6 +51,13 @@ static void send_ota_status(bool ok, uint32_t rcvd, uint32_t total, const char* 
     uint16_t len = 0;
     if (!hap_json_encode_ota_status(buf, sizeof(buf), &len, s)) return;
     hap_send(HapMsgType::OTA_STATUS, buf, len);
+    // Also log to P4 console — useful when S3 is also dumping
+    // hap_bridge: P4 OTA_STATUS lines, so the err string is visible
+    // even before the SPA progress UI surfaces it.
+    if (!ok) {
+        ESP_LOGE(TAG, "OTA_STATUS sent: ok=0 rcvd=%" PRIu32 "/%" PRIu32 " err='%s'",
+                 rcvd, total, err_msg ? err_msg : "");
+    }
 }
 
 // ── OTA_CHECKPOINT_REQ handler ────────────────────────────────────────────
@@ -73,12 +98,15 @@ void handle_ota_chunk(const HapFrame& f) {
         }
         esp_err_t err = esp_ota_begin(s_ota_part, hdr->total, &s_ota_handle);
         if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin failed: %s (total=%" PRIu32 ")",
+                     esp_err_to_name(err), hdr->total);
             send_ota_status(false, 0, hdr->total, esp_err_to_name(err));
             s_ota_part = nullptr;
             return;
         }
-        s_ota_expected_offset = 0;
-        s_ota_total           = hdr->total;
+        s_ota_expected_offset  = 0;
+        s_ota_total            = hdr->total;
+        s_ota_failure_notified = false;     // fresh begin — re-arm the notifier
         ESP_LOGI(TAG, "OTA begin: total=%" PRIu32 " part=%s",
                  hdr->total, s_ota_part->label);
     } else if (resuming) {
@@ -98,6 +126,11 @@ void handle_ota_chunk(const HapFrame& f) {
     if (data_len > 0 && s_ota_handle) {
         esp_err_t err = esp_ota_write(s_ota_handle, data, data_len);
         if (err != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "esp_ota_write failed at offset=%" PRIu32 " len=%u: %s "
+                     "(int_largest=%u)",
+                     hdr->offset, (unsigned)data_len, esp_err_to_name(err),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             esp_ota_abort(s_ota_handle);
             s_ota_handle = 0; s_ota_part = nullptr; s_ota_expected_offset = 0;
             send_ota_status(false, hdr->offset, hdr->total, esp_err_to_name(err));

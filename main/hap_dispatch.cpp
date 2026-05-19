@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include <cstdio>
 #include <cstdarg>
+#include <cassert>
 #include <unistd.h>
 #include <sys/time.h>
 #include <dirent.h>
@@ -96,6 +97,20 @@ struct HapTxItem {
 };
 static constexpr size_t HAP_TX_QUEUE_DEPTH = 32;
 static QueueHandle_t s_hap_tx_q = nullptr;
+
+// F-08: handles that reuse static-local scratch (raw[64], slots[64],
+// src_buf[]) must only run from one task — otherwise the buffers race.
+// The actual dispatcher is hap_slave_task (frames arrive via the
+// hap_session on_frame callback), not task_hap. Captured lazily on the
+// first guarded call so the check works regardless of which task owns
+// dispatch.
+static TaskHandle_t s_hap_task = nullptr;
+
+static inline void hap_dispatch_assert_single_task() {
+    TaskHandle_t cur = xTaskGetCurrentTaskHandle();
+    if (s_hap_task == nullptr) { s_hap_task = cur; return; }
+    assert(cur == s_hap_task);
+}
 
 // Forward decl — `send_alert` is defined below for the
 // existing event-bus subscribers, but `emit_attr_update` (above) now
@@ -324,6 +339,7 @@ static size_t emit_exposes_for_dev(const ZapDevice* dev, char* buf, size_t cap) 
 }
 
 static void handle_get_device_by_id(const HapFrame& req) {
+    hap_dispatch_assert_single_task();  // F-08: emit_attrs_for_dev uses a static scratch
     auto& tx_buf = s_hap_tx;  // P-F1 shared
     uint16_t len = 0;
 
@@ -456,10 +472,13 @@ static void handle_sync(const HapFrame& f) {
 
     auto& tx_buf = s_hap_tx;
     uint16_t len = 0;
+    // Report active (non-tombstoned) count to S3 so the SPA Info page
+    // matches the Devices page list (which filters zap_dev_is_removed).
+    const uint16_t n_active = pool_count_active();
     if (hap_json_encode_sync_ack(tx_buf, sizeof(tx_buf), &len,
-                                  info.session_id, "0.4.0", pool_count())) {
+                                  info.session_id, "0.4.0", n_active)) {
         hap_send(HapMsgType::SYNC, tx_buf, len, 0);
-        ESP_LOGI(TAG, "SYNC_ACK sent — %d devices", pool_count());
+        ESP_LOGI(TAG, "SYNC_ACK sent — %d devices", n_active);
     }
 }
 
@@ -646,6 +665,7 @@ static void handle_mqtt_msg_in(const HapFrame& f) {
 }
 
 static void handle_rule_list_req(const HapFrame& f) {
+    hap_dispatch_assert_single_task();  // F-08
     static RuleSlot        raw[64];
     static HapRuleSlotInfo slots[64];
     uint16_t count = simple_rules_list(raw, 64);
@@ -667,6 +687,7 @@ static void handle_rule_list_req(const HapFrame& f) {
 }
 
 static void handle_script_write(const HapFrame& f) {
+    hap_dispatch_assert_single_task();  // F-08
     char name_raw[HAP_SCRIPT_NAME_MAX + 8] = {0};
     static char src[HAP_SCRIPT_MAX_SRC + 1];
     HapRuleExecResult result{};
@@ -732,6 +753,7 @@ static void handle_script_run_req(const HapFrame& f) {
 // Feeds the SPA's inline linter; the answer is a SCRIPT_CHECK_RSP
 // with {ok, err, line}.
 static void handle_script_check_req(const HapFrame& f) {
+    hap_dispatch_assert_single_task();  // F-08
     static char name_raw[HAP_SCRIPT_NAME_MAX + 8];
     static char src_buf[HAP_SCRIPT_MAX_SRC + 1];
     name_raw[0] = '\0';
@@ -762,6 +784,7 @@ static void handle_script_check_req(const HapFrame& f) {
 }
 
 static void handle_script_list_req(const HapFrame& f) {
+    hap_dispatch_assert_single_task();  // F-08
     static HapScriptInfo scripts[LUA_SCRIPT_MAX];
     LuaScriptEntry lua_entries[LUA_SCRIPT_MAX];
     const uint16_t lua_count = lua_script_cache_list(
@@ -794,6 +817,7 @@ static void handle_script_list_req(const HapFrame& f) {
 }
 
 static void handle_script_read_req(const HapFrame& f) {
+    hap_dispatch_assert_single_task();  // F-08
     char name_raw[HAP_SCRIPT_NAME_MAX + 8] = {0};
     HapRuleExecResult err_result{};
     if (!hap_json_decode_script_read_req(f.payload, f.payload_len,
@@ -1163,7 +1187,10 @@ static void send_heartbeat() {
         if (b && b->is_running && b->is_running())
             hbi.proto_mask |= (1u << b->protocol);
     }
-    hbi.device_count = pool_count();
+    // pool_count_active filters out soft-removed slots so the SPA Info
+    // page agrees with the Devices page list. Raw pool_count() includes
+    // tombstones kept for re-pair fast-path.
+    hbi.device_count = pool_count_active();
     if (hap_json_encode_heartbeat(hb_buf, sizeof(hb_buf), &len, hbi)) {
         hap_send(HapMsgType::HEARTBEAT, hb_buf, len, HAP_FLAG_NO_ACK);
     }

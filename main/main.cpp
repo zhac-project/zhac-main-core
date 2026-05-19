@@ -212,7 +212,16 @@ extern "C" void app_main() {
 static void task_zigbee(void*) {
     ESP_LOGI(TAG, "TaskZigbee: starting ZNP init sequence");
 
-    device_shadow_init();   // restore device pool + attr cache before zigbee starts
+    // Bring up the device pool + restore the persisted snapshot BEFORE
+    // the shadow consumer so the shadow can iterate the loaded pool
+    // directly instead of opening the NVS namespace a second time
+    // (03-F06). zap_store_init() ran earlier at boot.
+    zigbee_pool_init();
+    zigbee_pool_restore_persisted();
+    device_shadow_init();
+    zigbee_pool_lock();
+    device_shadow_restore_from_pool(pool_all(), pool_count());
+    zigbee_pool_unlock();
     zb_diag_init();  // unhandled-frame ring (P3 observability, PSRAM)
     zhac_adapter_init();  // parallel observation path for the new ZCL library
     bool ok = zigbee_mgr_init();
