@@ -96,6 +96,82 @@ static void on_trust_center_join(const EzspFrame& f) {
     }
 }
 
+// ── ZCL Default Response (parity with the live ZNP path; the canonical
+//    implementation + full rationale live in
+//    zhac-components/.../zigbee_mgr/{zcl_commands,zigbee_mgr}.cpp). Sleepy
+//    devices ZCL-retransmit until ACKed. Fires only for unicast frames
+//    whose disable-default bit is clear and which are not themselves a
+//    response. EZSP is not the primary radio path today, so this duplicate
+//    is intentional — keep the gate in sync with the ZNP one. ────────────
+static bool ezsp_global_cmd_wants_default_response(uint8_t cmd_id) {
+    switch (cmd_id) {  // mirrors zcl_global_cmd_wants_default_response (ZNP)
+        case 0x01: case 0x04: case 0x05: case 0x07: case 0x09:
+        case 0x0B: case 0x0D: case 0x10: case 0x12: case 0x14: case 0x16:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static void ezsp_send_default_response(uint16_t nwk, uint8_t dst_ep,
+                                       uint16_t cluster, uint16_t group_id,
+                                       const uint8_t* zcl, uint8_t zcl_len) {
+    if (group_id != 0 || zcl_len < 3) return;
+    const uint8_t  in_fc   = zcl[0];
+    const bool     mfg     = (in_fc & 0x04) != 0;
+    const uint8_t  hdr_len = mfg ? 5u : 3u;
+    if (zcl_len < hdr_len) return;  // truncated mfg-spec header guard
+    const bool     is_cs    = (in_fc & 0x03) == 0x01;
+    const uint8_t  tsn      = mfg ? zcl[3] : zcl[1];
+    const uint8_t  cmd_id   = mfg ? zcl[4] : zcl[2];
+    const uint16_t mfg_code = mfg
+        ? ((uint16_t)zcl[1] | ((uint16_t)zcl[2] << 8)) : 0;
+    if ((in_fc & 0x10) != 0) return;                    // disable-default set
+    if (!is_cs && cmd_id == 0x0B) return;               // never ACK a DR (loop)
+    if (!is_cs && !ezsp_global_cmd_wants_default_response(cmd_id)) return;
+
+    // Build the ZCL Default Response: global cmd 0x0B, direction inverted,
+    // disable-default set on the reply, mfg-spec bit/code carried,
+    // payload = [original cmd id, status 0x00 SUCCESS].
+    uint8_t out_fc = 0x10;
+    if ((in_fc & 0x08) == 0) out_fc |= 0x08;
+    if (mfg)                 out_fc |= 0x04;
+    uint8_t body[8];
+    uint8_t bl = 0;
+    body[bl++] = out_fc;
+    if (mfg) {
+        body[bl++] = (uint8_t)(mfg_code & 0xFF);
+        body[bl++] = (uint8_t)((mfg_code >> 8) & 0xFF);
+    }
+    body[bl++] = tsn;
+    body[bl++] = 0x0B;     // ZCL Default Response
+    body[bl++] = cmd_id;   // original command being ACK'd
+    body[bl++] = 0x00;     // SUCCESS
+
+    // EZSP sendUnicast framing — mirrors ezsp_write_attr():
+    // type(1) dest(2) EmberApsFrame(11) messageTag(1) messageLength(1) msg(N)
+    uint8_t pl[16 + sizeof(body)];
+    pl[0]  = 0x00;                                       // EMBER_OUTGOING_DIRECT
+    pl[1]  = (uint8_t)(nwk & 0xFF);
+    pl[2]  = (uint8_t)((nwk >> 8) & 0xFF);
+    pl[3]  = ZB_PROFILE_HA & 0xFF; pl[4] = (ZB_PROFILE_HA >> 8) & 0xFF;
+    pl[5]  = (uint8_t)(cluster & 0xFF); pl[6] = (uint8_t)((cluster >> 8) & 0xFF);
+    pl[7]  = 0x01;                                       // srcEndpoint = coord EP1
+    pl[8]  = dst_ep;
+    pl[9]  = 0x40; pl[10] = 0x00;                        // options: APS_RETRY
+    pl[11] = 0x00; pl[12] = 0x00;                        // groupId
+    pl[13] = 0x00;                                       // sequence (NCP fills)
+    pl[14] = 0x01;                                       // messageTag
+    pl[15] = bl;
+    memcpy(pl + 16, body, bl);
+
+    EzspFrame rsp{};
+    if (!ezsp_cmd(EZSP_SEND_UNICAST, pl, (uint8_t)(16 + bl), rsp)) {
+        ESP_LOGD(TAG, "default-resp: sendUnicast no rsp nwk=0x%04x cluster=0x%04x",
+                 nwk, cluster);
+    }
+}
+
 static void on_incoming_message(const EzspFrame& f) {
     // Payload: type(1) apsFrame(11) lastHopLqi(1) lastHopRssi(1)
     //          sender(2) bindingIndex(1) addressIndex(1) messageLength(1) message(N)
@@ -143,6 +219,9 @@ static void on_incoming_message(const EzspFrame& f) {
     // adapter publishes decoded attributes through its own shadow hook,
     // so no explicit device_shadow_process() call is required here.
     if (dev && msg_len >= 3) {
+        // ACK first (parity with the ZNP zcl_attr_task ordering), then decode.
+        ezsp_send_default_response(sender, src_ep, cluster, group_id,
+                                   msg, msg_len);
         zhac_adapter_try_decode(dev->ieee_addr,
                                  dev->model_id,
                                  dev->manufacturer_name,

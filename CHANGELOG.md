@@ -7,6 +7,20 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **hap_dispatch**: `handle_device_options_set` applies the new per-device
+  `throttle_ms` shadow rate-limit (clamped ≤ 600000 ms) alongside
+  `occupancy_timeout` / `debounce_ms`. Lets the user throttle flood-prone
+  Tuya-DP sensors from the S3 API. (#84)
+- **ezsp_backend**: the EZSP radio path now emits a ZCL Default Response for
+  unicast frames whose disable-default-response bit is clear, reaching parity
+  with the live ZNP path (`zigbee_mgr`). Same gate — skips frames that are
+  themselves responses and honors the opt-out bit; builds the DR via
+  `EZSP_SEND_UNICAST`. EZSP is not the primary NCP today
+  (`CONFIG_ZHAC_NCP_ZNP=y`), so this only takes effect if the backend is
+  switched to EZSP — added so the two backends behave identically.
+
 ### Fixed — Medium (HAP stack review, 02-hap-stack.md)
 
 - **hap_dispatch**: guard every handler that uses static-local scratch

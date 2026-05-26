@@ -973,10 +973,12 @@ static void handle_device_options_set(const HapFrame& f) {
     uint64_t ieee = 0;
     int32_t occupancy_timeout_s = -1;  // -1 = absent
     int32_t debounce_ms         = -1;
+    int32_t throttle_ms         = -1;
     bool ok = true;
     bool any = false;
     if (hap_json_decode_device_options_set(f.payload, f.payload_len,
-                                           &ieee, &occupancy_timeout_s, &debounce_ms)) {
+                                           &ieee, &occupancy_timeout_s, &debounce_ms,
+                                           &throttle_ms)) {
         if (occupancy_timeout_s >= 0) {
             uint16_t v = (occupancy_timeout_s > 3600) ? 3600
                                                       : (uint16_t)occupancy_timeout_s;
@@ -988,9 +990,14 @@ static void handle_device_options_set(const HapFrame& f) {
             ok = ok && device_shadow_set_debounce_ms(ieee, v);
             any = true;
         }
-        ESP_LOGI(TAG, "DEVICE_OPTIONS_SET ieee=0x%016llx occ=%ld debounce=%ldms -> %s",
+        if (throttle_ms >= 0) {
+            uint32_t v = (throttle_ms > 600000) ? 600000 : (uint32_t)throttle_ms;
+            ok = ok && device_shadow_set_throttle_ms(ieee, v);
+            any = true;
+        }
+        ESP_LOGI(TAG, "DEVICE_OPTIONS_SET ieee=0x%016llx occ=%ld debounce=%ldms throttle=%ldms -> %s",
                  (unsigned long long)ieee,
-                 (long)occupancy_timeout_s, (long)debounce_ms,
+                 (long)occupancy_timeout_s, (long)debounce_ms, (long)throttle_ms,
                  (any && ok) ? "ok" : (any ? "fail" : "no-op"));
         if (!any) ok = false;  // nothing forwarded → NAK so caller retries
     } else {
