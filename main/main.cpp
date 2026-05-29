@@ -151,6 +151,7 @@ extern "C" void app_main() {
     zap_store_flush_init();
     esp_register_shutdown_handler(zap_store_flush_now);
 #ifdef CONFIG_ZHAC_NCP_EZSP
+#warning "F14 (FINDINGS.md): the EZSP/ASH backend is EXPERIMENTAL and INCOMPLETE (no ASH reliable layer, core device ops stubbed, RX never pumped). Do NOT ship. Select ZNP (CC2652) or C6 for a working radio."
     ezsp_backend_register();
 #else
     zigbee_backend_register();
@@ -184,15 +185,22 @@ extern "C" void app_main() {
         send_alert(HapAlertCode::RULE_ERROR, 0, msg);
     });
 
-    // Bring up the ZNP transport. This spawns the RX and worker tasks
-    // internally — no separate TaskZNP polling loop is required.
+    // Bring up the ZNP/MT transport (shared by the TI CC2652 ZNP backend and
+    // the ESP32-C6 ZNCP backend). F14 (FINDINGS.md): gate off the EZSP
+    // selection so choosing EZSP no longer silently boots the ZNP stack —
+    // the EZSP path owns its own (currently incomplete) transport.
+    // Spawns the RX and worker tasks internally — no separate TaskZNP loop.
+#if !defined(CONFIG_ZHAC_NCP_EZSP)
     znp_driver_init();
+#endif
     // znp_set_wire_trace(true) — opt-in only. Each frame produces 3 INFO
     // logs that forward over HAP as LOG_LINE; at 10 Hz device traffic that
     // saturates the slave TX queue and causes real ALERT/EVT drops.
 
     // TDD Section 8.1: task priorities and stack sizes
+#if !defined(CONFIG_ZHAC_NCP_EZSP)
     xTaskCreatePinnedToCore(task_zigbee,    "TaskZigbee",    zhac::stack::kZigbee, nullptr, 5, nullptr, 0);
+#endif
     // TaskLua is created internally by lua_engine_init()
     xTaskCreatePinnedToCore(task_hap,       "TaskHAP",       zhac::stack::kHapP4, nullptr, 4, nullptr, 0);
     xTaskCreate(             task_event_bus,"TaskEventBus",  zhac::stack::kEventBus, nullptr, 2, nullptr);

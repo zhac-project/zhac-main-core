@@ -35,3 +35,9 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES ${MAIN_REQUIRES}
 )
+
+# F17 (FINDINGS.md): warnings-as-errors for first-party app code. The clean
+# build was warning-free here at IDF's default level; -Werror keeps it so.
+# (embedded-zhc already enforces this; extending -Werror to the remaining
+# first-party components is a mechanical follow-up — backlog is ~0.)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Werror)

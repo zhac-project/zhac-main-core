@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // p4_ota.cpp — OTA update handler for P4 core firmware
 // Receives binary chunks from S3 over HAP, then flashes.
-// TODO: Add SHA-256 image integrity verification (blocked on mbedtls linkage in IDF v6).
+// F3 (FINDINGS.md): image integrity (structure + the build-appended
+// SHA-256) is verified by esp_ota_end() before the partition is made
+// bootable, plus an app-descriptor sanity check. AUTHENTICITY (tamper
+// resistance) requires Secure Boot v2 signed images — see F2 /
+// sdkconfig.prod.defaults.
 #include "p4_ota.h"
 #include "hap_dispatch.h"
 #include "hap_json.h"
 #include "hap_session.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -147,6 +152,18 @@ void handle_ota_chunk(const HapFrame& f) {
         if (err != ESP_OK) {
             s_ota_part = nullptr;
             send_ota_status(false, rcvd, hdr->total, esp_err_to_name(err));
+            return;
+        }
+        // F3 (FINDINGS.md): esp_ota_end() above already verified image
+        // self-integrity (structure + appended SHA-256). Defense in depth:
+        // confirm a valid ESP app descriptor before making it bootable.
+        // NOTE: integrity, NOT authenticity — tamper resistance requires
+        // Secure Boot v2 signed images (F2 / sdkconfig.prod.defaults).
+        esp_app_desc_t desc;
+        if (esp_ota_get_partition_description(s_ota_part, &desc) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA image has no valid app descriptor — aborting");
+            s_ota_part = nullptr;
+            send_ota_status(false, rcvd, hdr->total, "bad app descriptor");
             return;
         }
         err = esp_ota_set_boot_partition(s_ota_part);

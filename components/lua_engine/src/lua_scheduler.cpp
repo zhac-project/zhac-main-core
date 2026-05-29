@@ -46,17 +46,39 @@ static const char* TAG = "lua_sched";
 // work, tight enough that a misbehaving handler cannot starve other
 // coroutines for more than ~50 ms.
 static constexpr int64_t LUA_RESUME_DEADLINE_US = 50 * 1000;
+// F5 (FINDINGS.md): hard ceiling. Once a resume blows this (e.g. a script
+// wrapping a tight loop in pcall to swallow the soft-deadline error), the
+// hook switches to firing every instruction and keeps raising WITHOUT
+// resetting the deadline, so the runaway makes essentially no forward
+// progress and the error keeps being logged/counted. NOTE: stock Lua
+// cannot make a hook error truly uncatchable, so a pcall-guarded infinite
+// loop within a SINGLE resume still occupies TaskLua until it returns — a
+// known residual (a true abort needs a Lua patch or a supervised kill-task).
+static constexpr int64_t LUA_RESUME_HARD_US     = 250 * 1000;
 static constexpr int     LUA_RESUME_HOOK_COUNT  = 1000;
 static int64_t           s_resume_deadline_us   = 0;
+static int64_t           s_resume_hard_us       = 0;
+static bool              s_resume_killed        = false;
 
 static void lua_resume_count_hook(lua_State* L, lua_Debug*) {
-    if (esp_timer_get_time() < s_resume_deadline_us) return;
+    const int64_t now = esp_timer_get_time();
+    if (now < s_resume_deadline_us) return;
+    if (!s_resume_killed && now >= s_resume_hard_us) {
+        // Escalate: fire every instruction and keep raising. Not resetting
+        // the deadline means a pcall that catches the error can no longer
+        // buy another full LUA_RESUME_HOOK_COUNT window of progress.
+        s_resume_killed = true;
+        lua_sethook(L, lua_resume_count_hook, LUA_MASKCOUNT, 1);
+    }
     luaL_error(L, "lua_engine: resume exceeded %lld us budget",
                (long long)LUA_RESUME_DEADLINE_US);
 }
 
 static void arm_resume_deadline(lua_State* co) {
-    s_resume_deadline_us = esp_timer_get_time() + LUA_RESUME_DEADLINE_US;
+    const int64_t now    = esp_timer_get_time();
+    s_resume_deadline_us = now + LUA_RESUME_DEADLINE_US;
+    s_resume_hard_us     = now + LUA_RESUME_HARD_US;
+    s_resume_killed      = false;
     lua_sethook(co, lua_resume_count_hook,
                 LUA_MASKCOUNT, LUA_RESUME_HOOK_COUNT);
 }
@@ -133,6 +155,14 @@ extern "C" void lua_scheduler_coroutine_enter(void) {
     _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)n);
 }
 
+// F5 (FINDINGS.md): enforce CONFIG_LUA_ENGINE_MAX_COROUTINES, which was
+// previously decorative (referenced only in a log line). Checked at every
+// spawn site before lua_newthread so unbounded coroutine growth can't
+// exhaust the Lua heap.
+extern "C" bool lua_scheduler_at_capacity(void) {
+    return s_live_coroutines.load() >= (uint32_t)CONFIG_LUA_ENGINE_MAX_COROUTINES;
+}
+
 extern "C" void lua_scheduler_coroutine_exit(void)  {
     const uint32_t n = s_live_coroutines.fetch_sub(1) - 1;
     _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)n);
@@ -160,13 +190,23 @@ static void on_timer_fire(void* arg) {
     TimerSlot* slot = (TimerSlot*)arg;
     if (!slot || !slot->in_use) return;
     LuaMsg m = {};
-    m.kind                = MSG_RESUME;
+    m.kind                 = MSG_RESUME;
     m.resume.coroutine_ref = slot->coroutine_ref;
-    slot->in_use          = false;
-    slot->coroutine_ref   = -1;
-    BaseType_t hp_woken   = pdFALSE;
-    xQueueSendFromISR(s_resume_q, &m, &hp_woken);
-    if (hp_woken) portYIELD_FROM_ISR();
+    // Runs on the esp_timer TASK (dispatch_method = ESP_TIMER_TASK above), not
+    // an ISR — a plain xQueueSend is correct (the old xQueueSendFromISR was a
+    // latent mismatch). F29 (FINDINGS.md): only release the slot once the
+    // resume is actually enqueued. If the queue is full, DON'T drop it — that
+    // would leak the coroutine's registry ref (never resumed, never unref'd)
+    // and pin a timer slot + coroutine forever. Keep the slot and re-arm to
+    // retry shortly; the ref rides along in the slot until TaskLua drains.
+    if (xQueueSend(s_resume_q, &m, 0) == pdTRUE) {
+        slot->in_use        = false;
+        slot->coroutine_ref = -1;
+    } else {
+        ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
+                 slot->coroutine_ref);
+        esp_timer_start_once(slot->handle, 10 * 1000ULL);   // retry in 10 ms
+    }
 }
 
 static TimerSlot* slot_acquire(int coroutine_ref) {
@@ -403,6 +443,13 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
         lua_geti(L, -1, i);    // push handler fn
         if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
 
+        if (lua_scheduler_at_capacity()) {
+            lua_pop(L, 1);     // drop handler fn
+            ESP_LOGW(TAG, "lua: coroutine cap %d reached — skipping handlers",
+                     CONFIG_LUA_ENGINE_MAX_COROUTINES);
+            break;
+        }
+
         lua_State* co = lua_newthread(L);
         // Stack now: [..., handlers_tbl, fn, co]. Reorder to
         // [handlers_tbl, co, fn] then xmove fn onto co.
@@ -474,6 +521,12 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     }
     // Stack: [fn]. Wrap in a coroutine so yields (zhac.sleep etc.)
     // work and the caller doesn't block TaskLua.
+    if (lua_scheduler_at_capacity()) {
+        ESP_LOGW(TAG, "lua: coroutine cap %d reached — dropping script.run '%s'",
+                 CONFIG_LUA_ENGINE_MAX_COROUTINES, r->name);
+        lua_pop(L, 1);                                 // drop compiled fn
+        return;
+    }
     lua_State* co = lua_newthread(L);                 // [fn, co]
     lua_insert(L, -2);                                 // [co, fn]
     lua_xmove(L, co, 1);                               // fn → co. L: [co]
@@ -536,6 +589,11 @@ static void task_lua(void* arg) {
 // the function value. Returns the registry ref, or LUA_NOREF on OOM.
 extern "C" int lua_scheduler_spawn(lua_State* L) {
     if (!lua_isfunction(L, -1)) return LUA_NOREF;
+    if (lua_scheduler_at_capacity()) {
+        ESP_LOGW(TAG, "lua: coroutine cap %d reached — refusing spawn",
+                 CONFIG_LUA_ENGINE_MAX_COROUTINES);
+        return LUA_NOREF;
+    }
 
     lua_State* co = lua_newthread(L);
     // Stack now: [..., function, thread]. Move the function to the

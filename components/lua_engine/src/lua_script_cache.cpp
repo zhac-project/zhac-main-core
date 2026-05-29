@@ -52,6 +52,21 @@ bool build_path(char* out, size_t cap, const char* name) {
     return n > 0 && (size_t)n < cap;
 }
 
+// F42 (FINDINGS.md): count existing `*.lua` files so write() can enforce
+// LUA_SCRIPT_MAX. Cheap dirent scan — no per-file stat (unlike _list).
+uint16_t count_scripts() {
+    DIR* d = opendir(BASE_PATH);
+    if (!d) return 0;
+    uint16_t c = 0;
+    struct dirent* ent;
+    while ((ent = readdir(d))) {
+        const size_t flen = std::strlen(ent->d_name);
+        if (flen >= 5 && std::strcmp(ent->d_name + flen - 4, ".lua") == 0) c++;
+    }
+    closedir(d);
+    return c;
+}
+
 // One-shot lazy mount. `esp_vfs_spiffs_register` returns
 // ESP_ERR_INVALID_STATE if someone else already mounted — treat that
 // as success for idempotence.
@@ -128,6 +143,15 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
     const size_t src_len = std::strlen(src);
     if (src_len > 16 * 1024) {
         ESP_LOGW(TAG, "script '%s' too large: %zu bytes", name, src_len);
+        return false;
+    }
+
+    // F42 (FINDINGS.md): enforce LUA_SCRIPT_MAX. Overwriting an existing script
+    // is always allowed (count unchanged); only a NEW file is capped, so the
+    // scripts partition can't be exhausted by unbounded script count.
+    if (!lua_script_cache_exists(name) && count_scripts() >= LUA_SCRIPT_MAX) {
+        ESP_LOGW(TAG, "script cap reached (%d files) — '%s' rejected",
+                 LUA_SCRIPT_MAX, name);
         return false;
     }
 

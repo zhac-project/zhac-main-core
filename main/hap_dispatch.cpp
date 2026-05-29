@@ -69,17 +69,33 @@ void hap_send(HapMsgType type, const uint8_t* payload,
 // removal also resolves on the SPA side).
 
 // P-F1 (docs/OPTIMIZATIONS.md): one shared TX scratch for every HAP
-// handler. TaskHAP is single-threaded — only one handler runs at a
-// time, and `hap_send` copies the payload into the session's own slot
-// buffer before returning, so the scratch is free to be reused
-// immediately. Each handler aliases this with `auto& tx_buf = s_hap_tx`
-// to keep its existing `tx_buf` / `sizeof(tx_buf)` references working.
-// Heartbeat keeps its own buffer because it can race with a reply
-// emit during `hap_session_tick()`.
-// Park 4 KB outbound HAP scratch in PSRAM. Sequential memcpy + SPI
-// queue copy only; not touched in ISR or DMA. Frees the same off
+// *dispatch* handler. The dispatcher is the hap_session on_frame
+// callback, which runs on hap_slave_task; every registered handler runs
+// there, one at a time, and `hap_send` copies the payload into the
+// session's own slot buffer before returning, so the scratch is free to
+// be reused immediately. Handlers must take it via `auto& tx_buf =
+// hap_tx_scratch()` (below): that asserts the single-task invariant and
+// returns a reference to the array so `sizeof(tx_buf)` still works.
+//
+// IMPORTANT: code that runs on task_hap (NOT the dispatch task) must NOT
+// touch s_hap_tx. hap_slave_task is higher priority than task_hap and
+// preempts it, so a task_hap writer sharing s_hap_tx can be interrupted
+// mid-encode by a dispatch handler that re-encodes the same buffer; the
+// two-stage SPI CRC is computed after the corruption, so the torn frame
+// still passes CRC and the S3 receives malformed data (FINDINGS.md
+// Finding 4 — the same class as the original F-08 panic). The two
+// task_hap writers therefore keep their own buffers: `send_heartbeat`
+// uses `hb_buf`, and `emit_attr_update` uses `s_attr_tx`.
+//
+// Park the 4 KB outbound HAP scratch buffers in PSRAM. Sequential memcpy
+// + SPI queue copy only; not touched in ISR or DMA. Frees the same off
 // internal RAM (req: CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y).
 EXT_RAM_BSS_ATTR static uint8_t s_hap_tx[HAP_MAX_PAYLOAD];
+
+// Dedicated scratch for emit_attr_update — it runs on task_hap, not the
+// hap_slave_task dispatcher, so it must never alias s_hap_tx. See note
+// above (FINDINGS.md Finding 4).
+EXT_RAM_BSS_ATTR static uint8_t s_attr_tx[HAP_MAX_PAYLOAD];
 
 // ── Async HAP-tx queue (sync-SPI fix from docs/OPTIMIZATIONS.md hot-
 // path investigation, 2026-04-27) ────────────────────────────────────
@@ -112,6 +128,16 @@ static inline void hap_dispatch_assert_single_task() {
     assert(cur == s_hap_task);
 }
 
+// Hand a dispatch handler the shared TX scratch, asserting it runs on the
+// single dispatch task (hap_slave_task). Returns a reference to the array
+// so callers keep using `sizeof(tx_buf)`. task_hap writers
+// (emit_attr_update, send_heartbeat) must use their own buffers — see the
+// s_hap_tx note above (FINDINGS.md Finding 4).
+static auto hap_tx_scratch() -> uint8_t (&)[HAP_MAX_PAYLOAD] {
+    hap_dispatch_assert_single_task();
+    return s_hap_tx;
+}
+
 // Forward decl — `send_alert` is defined below for the
 // existing event-bus subscribers, but `emit_attr_update` (above) now
 // uses it from the LOW_BATTERY path.
@@ -128,7 +154,10 @@ static void emit_attr_update(const ZclAttrEvent& ze) {
         lqi       = d->link_quality;
         last_seen = d->last_seen;
     }
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    // Own scratch: emit_attr_update runs on task_hap, NOT the
+    // hap_slave_task dispatcher, so it must not share s_hap_tx with the
+    // dispatch handlers (FINDINGS.md Finding 4 — torn CRC-valid frames).
+    auto& tx_buf = s_attr_tx;
     uint16_t tx_len = 0;
     if (hap_json_encode_device_attr_update(tx_buf, sizeof(tx_buf), &tx_len,
                                            ze.ieee, ze.key,
@@ -249,7 +278,7 @@ static void populate_mem_metrics(HapHeartbeat& hb) {
 
 // ── Rule/script response helpers ──────────────────────────────────────────
 static void send_exec_result(HapMsgType type, const HapRuleExecResult& r) {
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (!hap_json_encode_rule_exec_result(tx_buf, sizeof(tx_buf), &tx_len, r)) {
         ESP_LOGE(TAG, "encode_exec_result failed"); return;
@@ -272,7 +301,7 @@ static void resolve_dev_labels(const ZapDevice* dev,
 
 // ── GET_DEVICES handler ───────────────────────────────────────────────────
 static void handle_get_devices(const HapFrame& req) {
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
     bool ok = hap_json_encode_device_list(
         tx_buf, sizeof(tx_buf), &len,
@@ -340,7 +369,7 @@ static size_t emit_exposes_for_dev(const ZapDevice* dev, char* buf, size_t cap) 
 
 static void handle_get_device_by_id(const HapFrame& req) {
     hap_dispatch_assert_single_task();  // F-08: emit_attrs_for_dev uses a static scratch
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
 
     uint64_t ieee = 0;
@@ -373,7 +402,7 @@ static void handle_set_attribute(const HapFrame& req) {
     // Route command: try protocol-agnostic backend dispatch first, then Zigbee-specific fallback
     bool ok = false;
     bool sent = false;
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
     {
         const char* key = (attr.key[0] != '\0') ? attr.key : "state";
@@ -470,7 +499,7 @@ static void handle_sync(const HapFrame& f) {
     if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
     if (info.is_ack) return;  // P4 doesn't initiate SYNC — ignore ACK
 
-    auto& tx_buf = s_hap_tx;
+    auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
     // Report active (non-tombstoned) count to S3 so the SPA Info page
     // matches the Devices page list (which filters zap_dev_is_removed).
@@ -594,7 +623,7 @@ static void handle_rule_update_dsl(const HapFrame& f) {
 static void handle_device_set_name(const HapFrame& f) {
     uint64_t ieee = 0;
     char new_name[30] = {};
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     bool encode_ok = false;
 
@@ -679,7 +708,7 @@ static void handle_rule_list_req(const HapFrame& f) {
                 sizeof(slots[i].src) - 1);
         slots[i].src[sizeof(slots[i].src) - 1] = '\0';
     }
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (hap_json_encode_rule_list_rsp(tx_buf, sizeof(tx_buf), &tx_len, slots, count)) {
         hap_send(HapMsgType::RULE_LIST_RSP, tx_buf, tx_len, HAP_FLAG_NO_ACK, f.seq);
@@ -758,7 +787,7 @@ static void handle_script_check_req(const HapFrame& f) {
     static char src_buf[HAP_SCRIPT_MAX_SRC + 1];
     name_raw[0] = '\0';
     src_buf[0]  = '\0';
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
 
     if (!hap_json_decode_script_check_req(f.payload, f.payload_len,
@@ -798,7 +827,7 @@ static void handle_script_list_req(const HapFrame& f) {
         scripts[count].size = lua_entries[i].size;
         count++;
     }
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     bool encoded = hap_json_encode_script_list_rsp(
         tx_buf, sizeof(tx_buf), &tx_len, scripts, count);
@@ -835,7 +864,7 @@ static void handle_script_read_req(const HapFrame& f) {
         send_exec_result(HapMsgType::SCRIPT_ACK, err_result);
         return;
     }
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (hap_json_encode_script_read_rsp(tx_buf, sizeof(tx_buf), &tx_len,
                                          name_raw, src_buf)) {
@@ -853,7 +882,7 @@ static void handle_permit_join(const HapFrame& f) {
 
 static void handle_bind_req(const HapFrame& f) {
     HapBindReq req{};
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     bool ok = false;
     if (hap_json_decode_bind_req(f.payload, f.payload_len, req)) {
@@ -874,7 +903,7 @@ static void handle_bind_req(const HapFrame& f) {
 static void handle_device_delete(const HapFrame& f) {
     uint64_t ieee = 0;
     bool hard = false;
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     bool ok = false;
     if (hap_json_decode_device_delete(f.payload, f.payload_len, &ieee, &hard)) {
@@ -1004,7 +1033,7 @@ static void handle_device_options_set(const HapFrame& f) {
         ESP_LOGW(TAG, "DEVICE_OPTIONS_SET decode failed");
         ok = false;
     }
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (hap_json_encode_device_options_ack(tx_buf, sizeof(tx_buf), &tx_len, ok)) {
         hap_send(HapMsgType::DEVICE_OPTIONS_SET_ACK, tx_buf, tx_len, HAP_FLAG_NO_ACK, f.seq);
@@ -1065,7 +1094,7 @@ static void handle_zigbee_cfg_set(const HapFrame& f) {
         }
     }
 
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (hap_json_encode_zigbee_cfg_ack(tx_buf, sizeof(tx_buf), &tx_len,
                                         ok, cur_chan, cur_set)) {
@@ -1132,7 +1161,7 @@ void handle_diag_unhandled_req(const HapFrame& f) {
         // Snapshot the diagnostics ring, encode as JSON, respond.
         static ZbUnhandledFrame snap[32];
         uint16_t n = zb_diag_snapshot(snap, 32);
-        auto& tx_buf = s_hap_tx;  // P-F1 shared
+        auto& tx_buf = hap_tx_scratch();
         // `last_seen_s` in the ring is *uptime-seconds* since P4
         // boot, not a Unix epoch — fmtSince on the SPA side turned
         // "20 s ago" into "493579 h ago". Emit the age relative to
@@ -1167,7 +1196,7 @@ void handle_metrics_req(const HapFrame& f) {
     // Freshen heap-value samples so the scrape reflects now-ish.
     metrics::update_memory_snapshot();
 
-    auto& tx_buf = s_hap_tx;  // P-F1 shared
+    auto& tx_buf = hap_tx_scratch();
     const size_t n = metrics::prometheus_format(
         reinterpret_cast<char*>(tx_buf), sizeof(tx_buf), "zhac_p4");
 

@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Production hardening overlay — ESP32-P4 main core  (FINDINGS.md F2 + F15)
+# ─────────────────────────────────────────────────────────────────────────
+# NOT applied to dev builds. Layer on top of the base config for RELEASE:
+#
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.prod.defaults" \
+#          fullclean build
+#
+# WARNING — irreversible on hardware: Secure Boot v2 + Flash Encryption
+# (release mode) burn eFuses on first boot and cannot be undone. Anti-
+# rollback permanently refuses lower secure_version images. Validate on a
+# sacrificial unit first. See Espressif's Secure Boot V2 / Flash Encryption
+# guides.
+#
+# The P4 holds the Zigbee network key (NVS) and receives OTA images over
+# HAP; Secure Boot makes esp_ota_end() reject unsigned/tampered images
+# (the authenticity half of F3 — the integrity half is already enforced).
+
+# ── Secure Boot v2 ───────────────────────────────────────────────────────
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+#   CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
+
+# ── Flash Encryption — release mode ──────────────────────────────────────
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+
+# ── Anti-rollback (pairs with signed OTA, F3) ────────────────────────────
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+CONFIG_BOOTLOADER_APP_SECURE_VERSION=1
+
+# ── Debug surface lock-down (F15) ────────────────────────────────────────
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+CONFIG_LOG_MAXIMUM_LEVEL_WARN=y
+CONFIG_LOG_MAXIMUM_LEVEL=2
+CONFIG_ESP_DEBUG_OCDAWARE=n
+# Coredump-to-flash is ciphertext only with Flash Encryption above; without
+# it, also set: CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=n
