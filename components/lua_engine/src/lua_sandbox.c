@@ -53,6 +53,22 @@ bool lua_engine_sandbox_apply(lua_State* L) {
     lua_pushnil(L);
     lua_setglobal(L, "io");
 
+    // Q10 (QWEN_FINDINGS triage): luaL_openlibs also cached the io library in
+    // package.loaded.io, so nilling _G.io alone leaves it recoverable via
+    // `package.loaded.io.open(...)` (or require("io")). Purge the cached ref.
+    // `require` itself stays — lua_require.c needs it for the zhac/cjson/lpeg/
+    // miniz native modules; only the fully-removed io module is cleared here.
+    lua_getglobal(L, "package");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "loaded");
+        if (lua_istable(L, -1)) {
+            lua_pushnil(L);
+            lua_setfield(L, -2, "io");
+        }
+        lua_pop(L, 1);   // package.loaded
+    }
+    lua_pop(L, 1);       // package
+
     // os.* — keep time/clock/date/difftime; remove shell escapes.
     redact(L, "os", "execute");
     redact(L, "os", "exit");
@@ -85,6 +101,17 @@ bool lua_engine_sandbox_apply(lua_State* L) {
     // on a big heap — a tight loop DoSes every coroutine on TaskLua.
     // The engine still drives gc via the C API (lua_gc).
     lua_pushnil(L); lua_setglobal(L, "collectgarbage");
+
+    // Q9 (QWEN_FINDINGS triage): the CPU-runaway guard is a per-thread debug
+    // hook (lua_scheduler.cpp installs LUA_MASKCOUNT on each scheduler-resumed
+    // coroutine). A script that creates its OWN coroutine via coroutine.create
+    // / coroutine.wrap gets a thread with NO hook — an infinite loop inside it
+    // bypasses the guard and wedges TaskLua. The scheduler drives script
+    // coroutines through the C API (lua_newthread/lua_resume) and yields via
+    // zhac.sleep, so user-level coroutine *creation* isn't needed. Redact it;
+    // yield/resume/status/running stay for operating on existing threads.
+    redact(L, "coroutine", "create");
+    redact(L, "coroutine", "wrap");
 
     // debug.* — keep only traceback for error formatting.
     lua_getglobal(L, "debug");

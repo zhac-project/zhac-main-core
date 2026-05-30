@@ -277,13 +277,19 @@ static void populate_mem_metrics(HapHeartbeat& hb) {
 }
 
 // ── Rule/script response helpers ──────────────────────────────────────────
-static void send_exec_result(HapMsgType type, const HapRuleExecResult& r) {
+static void send_exec_result(HapMsgType type, const HapRuleExecResult& r,
+                             uint16_t ack_seq) {
     auto& tx_buf = hap_tx_scratch();
     uint16_t tx_len = 0;
     if (!hap_json_encode_rule_exec_result(tx_buf, sizeof(tx_buf), &tx_len, r)) {
         ESP_LOGE(TAG, "encode_exec_result failed"); return;
     }
-    hap_send(type, tx_buf, tx_len, HAP_FLAG_NO_ACK);
+    // Echo the request's seq as ack_seq so S3's hap_roundtrip_v2 can correlate
+    // this reply to its waiter slot (it matches replies by ack_seq). Without it
+    // the reply carried ack_seq=0, no waiter matched, and EVERY rule/script
+    // roundtrip (enable/disable/create/delete/update + script write/delete/run)
+    // hit the 5 s timeout the operator saw on rule.enable.
+    hap_send(type, tx_buf, tx_len, HAP_FLAG_NO_ACK, ack_seq);
 }
 
 // Resolver thunk used by the hap_json device encoders to look up
@@ -561,7 +567,7 @@ static void handle_rule_create(const HapFrame& f) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
     }
-    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result);
+    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result, f.seq);
 }
 
 static void handle_rule_delete(const HapFrame& f) {
@@ -576,7 +582,7 @@ static void handle_rule_delete(const HapFrame& f) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
     }
-    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result);
+    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result, f.seq);
 }
 
 static void handle_rule_update(const HapFrame& f) {
@@ -591,7 +597,7 @@ static void handle_rule_update(const HapFrame& f) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
     }
-    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result);
+    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result, f.seq);
 }
 
 static void handle_rule_update_dsl(const HapFrame& f) {
@@ -617,7 +623,7 @@ static void handle_rule_update_dsl(const HapFrame& f) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
     }
-    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result);
+    send_exec_result(HapMsgType::RULE_EXEC_RESULT, result, f.seq);
 }
 
 static void handle_device_set_name(const HapFrame& f) {
@@ -725,7 +731,7 @@ static void handle_script_write(const HapFrame& f) {
                                        src, sizeof(src))) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
         return;
     }
     if (lua_script_cache_write(name_raw, src)) {
@@ -737,7 +743,7 @@ static void handle_script_write(const HapFrame& f) {
         strncpy(result.err, "invalid name or stage failed",
                 sizeof(result.err) - 1);
     }
-    send_exec_result(HapMsgType::SCRIPT_ACK, result);
+    send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
 }
 
 static void handle_script_delete(const HapFrame& f) {
@@ -747,13 +753,13 @@ static void handle_script_delete(const HapFrame& f) {
                                         name_raw, sizeof(name_raw))) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
         return;
     }
     lua_script_cache_delete(name_raw);
     result.ok = true;
     ESP_LOGI(TAG, "SCRIPT_DELETE name=%s", name_raw);
-    send_exec_result(HapMsgType::SCRIPT_ACK, result);
+    send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
 }
 
 // SCRIPT_RUN_REQ — fire the named script as a fresh Lua coroutine.
@@ -764,18 +770,18 @@ static void handle_script_run_req(const HapFrame& f) {
                                          name_raw, sizeof(name_raw))) {
         result.ok = false;
         strncpy(result.err, "decode failed", sizeof(result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
         return;
     }
     if (!lua_engine_run_script(name_raw)) {
         result.ok = false;
         strncpy(result.err, "not found or queue full", sizeof(result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
         return;
     }
     result.ok = true;
     ESP_LOGI(TAG, "SCRIPT_RUN name=%s", name_raw);
-    send_exec_result(HapMsgType::SCRIPT_ACK, result);
+    send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
 }
 
 // SCRIPT_CHECK_REQ — syntax-check a source buffer without executing.
@@ -853,7 +859,7 @@ static void handle_script_read_req(const HapFrame& f) {
                                           name_raw, sizeof(name_raw))) {
         err_result.ok = false;
         strncpy(err_result.err, "decode failed", sizeof(err_result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, err_result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, err_result, f.seq);
         return;
     }
     static char src_buf[HAP_SCRIPT_MAX_SRC + 1];
@@ -861,7 +867,7 @@ static void handle_script_read_req(const HapFrame& f) {
     if (n < 0) {
         err_result.ok = false;
         strncpy(err_result.err, "not found", sizeof(err_result.err) - 1);
-        send_exec_result(HapMsgType::SCRIPT_ACK, err_result);
+        send_exec_result(HapMsgType::SCRIPT_ACK, err_result, f.seq);
         return;
     }
     auto& tx_buf = hap_tx_scratch();

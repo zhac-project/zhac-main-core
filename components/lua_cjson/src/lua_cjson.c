@@ -83,6 +83,21 @@
 #define DEFAULT_SPARSE_SAFE 10
 #define DEFAULT_ENCODE_MAX_DEPTH 1000
 #define DEFAULT_DECODE_MAX_DEPTH 1000
+/* Q1 (QWEN_FINDINGS triage): hard cap on encode output. strbuf grows via system
+ * malloc/realloc (internal heap, outside the Lua budget), and strbuf.c die()
+ * abort()s the firmware on allocator failure — so an unbounded cjson.encode()
+ * from an (unauthenticated) script is a device-reboot DoS. Exceeding the cap
+ * raises a catchable Lua error instead of growing the buffer toward abort().
+ * 64 KB (lowered from 256 KB) is still far above any legitimate device JSON
+ * (MQTT/HAP payloads are a few KB) yet keeps the largest single strbuf realloc
+ * small, so it is far less likely to FAIL — and thus abort — on a fragmented P4
+ * internal heap. Decode needs no cap: its strbuf is bounded by the input string,
+ * which is already Lua-heap-bounded.
+ * Residual (deliberately NOT fixed blind): a genuine system-OOM can still trip
+ * strbuf's abort(). The full fix is routing strbuf through the Lua allocator +
+ * a setjmp/luaL_error harness (the OpenResty lua-cjson fork) — an invasive
+ * vendored rewrite that needs a host test, so it stays a documented residual. */
+#define CJSON_ENCODE_MAX_OUTPUT (64 * 1024)
 #define DEFAULT_ENCODE_INVALID_NUMBERS 0
 #define DEFAULT_DECODE_INVALID_NUMBERS 1
 #define DEFAULT_ENCODE_KEEP_BUFFER 1
@@ -803,6 +818,13 @@ static int json_append_data(lua_State *l, json_config_t *cfg,
     int as_array = 0;
     int has_metatable;
     int raw = 1;
+
+    /* Q1: bound total output (see CJSON_ENCODE_MAX_OUTPUT) — checked per value,
+     * mirroring json_check_encode_depth's luaL_error pattern, so a huge table
+     * can't grow strbuf until the system allocator abort()s the device. */
+    if (strbuf_length(json) > CJSON_ENCODE_MAX_OUTPUT)
+        luaL_error(l, "cjson: encode output exceeds %d bytes",
+                   CJSON_ENCODE_MAX_OUTPUT);
 
     switch (lua_type(l, -1)) {
     case LUA_TSTRING:
