@@ -505,6 +505,13 @@ static void handle_sync(const HapFrame& f) {
     if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
     if (info.is_ack) return;  // P4 doesn't initiate SYNC — ignore ACK
 
+    // A real inbound SYNC_REQ is S3 (re-)establishing the link — possibly after
+    // it gave up on a half-dead link (roundtrip-timeout streak). Drop any stale
+    // in-flight retransmit frames so the recovered link starts with an empty
+    // window, even if on_link_dead never fired (e.g. a unidirectional outage
+    // with no P4 NEEDS_ACK frames in flight at the time). Idempotent + cheap.
+    hap_session_reset_link();
+
     auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
     // Report active (non-tombstoned) count to S3 so the SPA Info page
@@ -1261,7 +1268,17 @@ void task_hap(void*) {
                 ESP_LOGW(TAG, "unhandled HAP type=0x%02x", idx);
         },
         .on_sync      = handle_sync,
-        .on_link_dead = []() { ESP_LOGE(TAG, "HAP link dead — awaiting SYNC"); },
+        .on_link_dead = []() {
+            // Data S3→P4 requests are NO_ACK, so S3's window-based detector never
+            // fires for them; recovery is now driven by S3's roundtrip-timeout
+            // streak forcing a re-SYNC (see net-core hap_bridge.cpp). Free our
+            // in-flight retransmit window now so siblings of the dead frame can't
+            // keep retransmitting stale pre-outage seqs and wedge the window full
+            // before/after that re-SYNC. Cheap + non-blocking; heartbeats keep
+            // running (S3 still needs them as a coarse liveness signal).
+            ESP_LOGE(TAG, "HAP link dead — clearing in-flight window, awaiting S3 re-SYNC");
+            hap_session_reset_link();
+        },
     });
 
     hap_slave_set_callback([](const HapFrame& f) {
