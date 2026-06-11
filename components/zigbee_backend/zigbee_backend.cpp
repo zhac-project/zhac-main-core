@@ -49,11 +49,7 @@ static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t va
     // pointer is only valid while zigbee_pool_lock() is held (a concurrent
     // swap-with-last pool_remove can retarget the slot).
     ZapDevice snap;
-    bool found = false;
-    zigbee_pool_lock();
-    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
-    zigbee_pool_unlock();
-    if (!found) {
+    if (!zigbee_pool_snapshot(ieee, &snap)) {
         ESP_LOGW(TAG, "write_attr: device 0x%016llx not in pool", (unsigned long long)ieee);
         return false;
     }
@@ -108,13 +104,8 @@ static bool zb_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out
 }
 
 static bool zb_get_device(uint64_t ieee, ZapDevice* out) {
-    // F6/F35: copy under the lock — the *out = *dev copy itself races a
-    // swap-with-last remove when done on an unlocked pointer.
-    bool found = false;
-    zigbee_pool_lock();
-    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { *out = *dev; found = true; }
-    zigbee_pool_unlock();
-    return found;
+    // F6/F35: locked find+copy — the helper copies under the pool mutex.
+    return zigbee_pool_snapshot(ieee, out);
 }
 
 static bool zb_remove_device(uint64_t ieee) {

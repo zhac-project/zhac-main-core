@@ -400,10 +400,7 @@ static void handle_get_device_by_id(const HapFrame& req) {
     // (shadow attrs, exposes JSON) run on the detached copy with no pool
     // pointer in flight. 522 B stack copy — hap_slave stack is 8 KiB.
     ZapDevice dev_snap;
-    bool found = false;
-    zigbee_pool_lock();
-    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { dev_snap = *dev; found = true; }
-    zigbee_pool_unlock();
+    const bool found = zigbee_pool_snapshot(ieee, &dev_snap);
     bool ok = found
         ? hap_json_encode_device_info_full(tx_buf, sizeof(tx_buf), &len, &dev_snap,
                                              &resolve_dev_labels,
@@ -445,13 +442,7 @@ static void handle_set_attribute(const HapFrame& req) {
             // F6/F35: snapshot under the pool lock; the blocking radio
             // sends below run on the detached copy.
             ZapDevice dev_snap;
-            bool dev_found = false;
-            zigbee_pool_lock();
-            if (const ZapDevice* dev = pool_find_by_ieee(attr.ieee)) {
-                dev_snap = *dev;
-                dev_found = true;
-            }
-            zigbee_pool_unlock();
+            const bool dev_found = zigbee_pool_snapshot(attr.ieee, &dev_snap);
             uint8_t ep = (attr.ep != 0) ? attr.ep
                          : (dev_found && dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
 

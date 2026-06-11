@@ -140,11 +140,7 @@ static int l_zhac_set_attr(lua_State* L) {
     // radio sends below run on the detached copy — never on a raw pool
     // pointer that a swap-with-last remove could retarget.
     ZapDevice snap;
-    bool found = false;
-    zigbee_pool_lock();
-    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
-    zigbee_pool_unlock();
-    if (!found) {
+    if (!zigbee_pool_snapshot(ieee, &snap)) {
         ESP_LOGW(TAG, "set_attr: device 0x%016" PRIx64 " not in pool", ieee);
         lua_pushboolean(L, 0);
         return 1;
