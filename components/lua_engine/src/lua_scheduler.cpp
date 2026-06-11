@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // lua_scheduler.c — TaskLua + resume queue + timer pool.
 //
-// Single-threaded: TaskLua is the only task that ever touches g_L.
+// Single-threaded: TaskLua is the only task that ever touches g_L —
+// including the boot-time script load, which rides MSG_LOAD_ALL.
 // External code reaches Lua by pushing a ResumeMsg onto s_resume_q;
 // the scheduler dequeues, resumes the target coroutine, and on
 // yield/finish updates the registry-held reference.
@@ -94,14 +95,18 @@ static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
 
 // ── Resume queue ──────────────────────────────────────────────────────
 //
-// Two message kinds share one queue:
-//  - MSG_RESUME: resume an existing coroutine by registry ref.
-//  - MSG_EVENT:  iterate a REG_ON_* table and spawn a coroutine per
-//                handler, passing unpacked event fields.
+// Message kinds sharing one queue:
+//  - MSG_RESUME:    resume an existing coroutine by registry ref.
+//  - MSG_EVENT:     iterate a REG_ON_* table and spawn a coroutine per
+//                   handler, passing unpacked event fields.
+//  - MSG_RUN_NAMED: compile + run one named script from the cache.
+//  - MSG_LOAD_ALL:  boot-time pass — compile + start every stored
+//                   script. No payload.
 enum LuaMsgKind : uint8_t {
     MSG_RESUME    = 0,
     MSG_EVENT     = 1,
     MSG_RUN_NAMED = 2,
+    MSG_LOAD_ALL  = 3,
 };
 
 enum LuaEventKind : uint8_t {
@@ -302,12 +307,28 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
     return ok;
 }
 
+// Boot-time script load. lua_engine_load_all() pushes this instead of
+// compiling + spawning on its caller's task: TaskLua may already be
+// resuming earlier coroutines on the same lua_State, and the VM has no
+// internal locking — every touch must come from TaskLua. Called once
+// from app_main strictly after lua_engine_init() succeeded (which is
+// what creates s_resume_q), the same init-before-push ordering every
+// other push_* relies on. Returns false when the queue is full.
+extern "C" bool lua_scheduler_push_load_all(void) {
+    LuaMsg m = {};
+    m.kind = MSG_LOAD_ALL;
+    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+    return ok;
+}
+
 // ── Coroutine driver ──────────────────────────────────────────────────
 //
 // Registry-ref ownership map — keep in sync with zhac_lua_module.cpp:
 //
 //   spawn ref   taken by spawn_coroutine() (dispatch_event /
-//               run_named_script / lua_scheduler_spawn) to anchor the
+//               run_named_script / load_one_script /
+//               lua_scheduler_spawn) to anchor the
 //               fresh thread while it runs. Settled by
 //               resume_and_settle() on every outcome of the resume it
 //               drives (for lua_scheduler_spawn the ref rides a
@@ -577,6 +598,84 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     resume_and_settle(L, co, ref, argc, err_ctx);
 }
 
+// ── Boot-time load-all (MSG_LOAD_ALL) ─────────────────────────────────
+//
+// Body of lua_engine_load_all(). It ran on app_main until the P0
+// findings review: app_main compiled + spawned stored scripts on g_L
+// while TaskLua — unpinned, genuinely parallel on the dual-core P4 —
+// could already be resuming script 1's coroutine (its spawn pushed an
+// immediate MSG_RESUME). Two tasks inside one unlocked lua_State
+// corrupt the VM as soon as a second stored script exists. The pass
+// now rides MSG_LOAD_ALL and executes here, on TaskLua, like every
+// other lua_State touch.
+
+// Compile + run one cached script as a top-level coroutine. Each file
+// gets its own coroutine so an error or `zhac.sleep` in one script
+// doesn't block the others.
+static bool load_one_script(lua_State* L, const char* name) {
+    // Park 16 KB script-load scratch in PSRAM. One-shot lazy init,
+    // never freed — same lifetime as the original BSS-static array.
+    constexpr size_t kBufSz = 16 * 1024;
+    static char* buf = nullptr;
+    if (!buf) {
+        buf = static_cast<char*>(
+            heap_caps_malloc(kBufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!buf) buf = static_cast<char*>(heap_caps_malloc(kBufSz, MALLOC_CAP_8BIT));
+        if (!buf) {
+            ESP_LOGE(TAG, "load_one_script: buf alloc failed");
+            return false;
+        }
+    }
+    const int n = lua_script_cache_read(name, buf, kBufSz);
+    if (n < 0) {
+        ESP_LOGW(TAG, "script '%s' not readable", name);
+        return false;
+    }
+    if (luaL_loadbufferx(L, buf, (size_t)n, name, "t") != LUA_OK) {
+        ESP_LOGE(TAG, "compile '%s': %s", name, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return false;
+    }
+    if (lua_scheduler_at_capacity()) {
+        ESP_LOGW(TAG, "lua: coroutine cap %d reached — skipping '%s'",
+                 CONFIG_LUA_ENGINE_MAX_COROUTINES, name);
+        lua_pop(L, 1);                                 // drop compiled fn
+        return false;
+    }
+    int ref = LUA_NOREF;
+    lua_State* co = spawn_coroutine(L, &ref);          // consumes fn
+    if (!co) {
+        ESP_LOGE(TAG, "spawn '%s' failed", name);
+        return false;
+    }
+    // First resume runs inline — we ARE TaskLua here, so detouring
+    // through lua_scheduler_spawn's push-MSG_RESUME-to-self would burn
+    // up to LUA_SCRIPT_MAX queue slots while this handler holds the
+    // task (deterministic overflow at the Kconfig-minimum depth of 8)
+    // and would let an already-queued event dispatch BEFORE the
+    // scripts' top-level registrations run. Inline keeps the original
+    // ordering: once MSG_LOAD_ALL is handled, every script has run to
+    // its first yield/finish, so events behind it see all handlers.
+    char err_ctx[48];   // "script '<name≤24>' error" — worst case 40 + NUL
+    snprintf(err_ctx, sizeof(err_ctx), "script '%s' error", name);
+    resume_and_settle(L, co, ref, 0, err_ctx);
+    return true;   // loaded = compiled + started; runtime errors are
+                   // logged/counted by resume_and_settle, as before
+}
+
+// Iterate the SPIFFS script cache, compile + start each entry. A bad
+// script is logged and skipped, NEVER allowed to abort the loop — one
+// broken file must not take the rest down or boot-loop the node.
+static void load_all_scripts(lua_State* L) {
+    LuaScriptEntry entries[LUA_SCRIPT_MAX];
+    const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
+    uint16_t loaded = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        if (load_one_script(L, entries[i].name)) loaded++;
+    }
+    ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
+}
+
 static void task_lua(void* arg) {
     lua_State* L = (lua_State*)arg;
     ESP_LOGI(TAG, "TaskLua started");
@@ -589,6 +688,8 @@ static void task_lua(void* arg) {
             dispatch_event(L, &m.event);
         } else if (m.kind == MSG_RUN_NAMED) {
             run_named_script(L, &m.named);
+        } else if (m.kind == MSG_LOAD_ALL) {
+            load_all_scripts(L);
         }
     }
 }

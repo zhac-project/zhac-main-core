@@ -53,6 +53,12 @@ typedef struct {
 bool lua_scheduler_push_run_named(const char* name,
                                     const LuaScriptInvokeArgs* args);
 
+// Enqueue the boot-time "compile + spawn every stored script" pass
+// (MSG_LOAD_ALL). The body runs on TaskLua so it cannot race in-flight
+// coroutine resumes on the shared lua_State. Returns false when the
+// queue is full.
+bool lua_scheduler_push_load_all(void);
+
 // Consume the function on top of `L` (the master state), wrap it in a
 // new coroutine, register it, and enqueue an initial resume. Returns
 // the registry ref or LUA_NOREF on OOM.

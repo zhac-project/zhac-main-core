@@ -38,6 +38,27 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   coroutine, owned by whatever will resume it.
   (`lua_scheduler.cpp:326,480,558`)
 
+- **lua_engine**: `lua_engine_load_all()` no longer compiles + spawns the
+  stored scripts on the calling task (app_main). With ≥2 stored scripts,
+  script 1's spawn pushes an immediate resume that TaskLua — unpinned,
+  genuinely parallel on the dual-core P4 — could be executing on `g_L`
+  while app_main was still compiling script 2: two tasks inside one
+  unlocked `lua_State`, i.e. VM corruption at boot. The public entry now
+  just enqueues a new `MSG_LOAD_ALL` message (fire-and-forget; the sole
+  caller never consumed a result) and the pass executes inside the
+  TaskLua queue handler, serialising every `lua_State` touch on the one
+  task that owns it. In-handler, each script's first resume runs inline
+  via `spawn_coroutine()`/`resume_and_settle()` (the Task-2 spawn path,
+  same as `dispatch_event`/`run_named_script`) rather than detouring
+  through `lua_scheduler_spawn`'s push-to-self — which would have eaten
+  up to `LUA_SCRIPT_MAX` (16) queue slots mid-handler (deterministic
+  overflow at the Kconfig-minimum depth of 8, silently dropping scripts)
+  and let an already-queued event dispatch before the scripts' top-level
+  registrations existed. Per-script failure tolerance is unchanged: a
+  script that fails to read/compile/spawn is logged and skipped, never
+  aborting the loop (no boot-loop from one broken file).
+  (`lua_engine.c:118`, now `lua_scheduler.cpp`)
+
 ### Fixed — Medium (HAP stack review, 02-hap-stack.md)
 
 - **hap_dispatch**: guard every handler that uses static-local scratch
