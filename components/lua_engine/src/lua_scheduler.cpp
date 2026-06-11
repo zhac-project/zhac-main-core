@@ -323,10 +323,11 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
 // must release the ref it came in with on ALL paths: LUA_OK / error
 // (thread finished — unref + live-count exit) and LUA_YIELD too,
 // because the continuation armed during the yield holds its own fresh
-// ref. Keeping the caller's ref across a yield leaked one registry
-// slot per zhac.sleep iteration and pinned every yielded-once
-// coroutine forever — `while true do zhac.sleep(1000) end` grew the
-// registry until the 4 MB Lua heap budget was exhausted.
+// ref. Known exception: a script calling bare `coroutine.yield()`
+// with no sleep slot armed gets its ref dropped all the same — the
+// thread becomes GC-able and is never resumed (orphaned by design;
+// its live-count slot stays — pre-existing drift; see lua_sandbox.c,
+// which keeps coroutine.yield exposed).
 
 // Drives one lua_resume step of `co` (nargs args already pushed on co)
 // and settles `ref`, the registry ref the caller holds on the thread.
