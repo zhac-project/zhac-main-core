@@ -21,6 +21,23 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   (`CONFIG_ZHAC_NCP_ZNP=y`), so this only takes effect if the backend is
   switched to EZSP — added so the two backends behave identically.
 
+### Fixed — Critical (P0 findings review)
+
+- **lua_engine**: coroutine registry refs are now released on `LUA_YIELD`,
+  not only on finish/error. `zhac.sleep` takes a FRESH registry ref on every
+  call before yielding, so the ref the resumer came in with was already
+  redundant the moment the coroutine yielded — but `resume_coroutine` kept
+  it, leaking one registry slot per sleep iteration (`while true do
+  zhac.sleep(1000) end` exhausted the 4 MB Lua heap budget over days), and
+  `dispatch_event` / `run_named_script` kept their spawn-time ref after a
+  yielding handler / `script.run`, leaking a ref and pinning the finished
+  coroutine forever. The resume/status/unref logic — previously three
+  drifting copies — now lives in a single `resume_and_settle()` helper (plus
+  a shared `spawn_coroutine()` for the newthread/xmove/ref sequence) that
+  enforces the invariant: exactly one live registry ref per suspended
+  coroutine, owned by whatever will resume it.
+  (`lua_scheduler.cpp:326,480,558`)
+
 ### Fixed — Medium (HAP stack review, 02-hap-stack.md)
 
 - **hap_dispatch**: guard every handler that uses static-local scratch

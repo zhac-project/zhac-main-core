@@ -303,6 +303,77 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
 }
 
 // ── Coroutine driver ──────────────────────────────────────────────────
+//
+// Registry-ref ownership map — keep in sync with zhac_lua_module.cpp:
+//
+//   spawn ref   taken by spawn_coroutine() (dispatch_event /
+//               run_named_script / lua_scheduler_spawn) to anchor the
+//               fresh thread while it runs. Settled by
+//               resume_and_settle() on every outcome of the resume it
+//               drives (for lua_scheduler_spawn the ref rides a
+//               MSG_RESUME and is settled by resume_coroutine).
+//   sleep ref   zhac.sleep takes a FRESH ref to the running thread on
+//               every call, parks it in a TimerSlot, then yields. From
+//               that point it is the single owner of the suspended
+//               coroutine; on timer fire it rides MSG_RESUME into
+//               resume_coroutine and is settled there.
+//
+// Invariant: exactly ONE live registry ref per suspended coroutine —
+// the one held by whatever will resume it. Whoever calls lua_resume
+// must release the ref it came in with on ALL paths: LUA_OK / error
+// (thread finished — unref + live-count exit) and LUA_YIELD too,
+// because the continuation armed during the yield holds its own fresh
+// ref. Keeping the caller's ref across a yield leaked one registry
+// slot per zhac.sleep iteration and pinned every yielded-once
+// coroutine forever — `while true do zhac.sleep(1000) end` grew the
+// registry until the 4 MB Lua heap budget was exhausted.
+
+// Drives one lua_resume step of `co` (nargs args already pushed on co)
+// and settles `ref`, the registry ref the caller holds on the thread.
+// The ref is released on EVERY path; after a LUA_YIELD the thread
+// stays anchored by the fresh ref the yield path (zhac.sleep) took
+// before yielding. `err_ctx` prefixes the error log so each call site
+// keeps its existing message.
+static void resume_and_settle(lua_State* L, lua_State* co, int ref,
+                              int nargs, const char* err_ctx) {
+    int nres = 0;
+    arm_resume_deadline(co);
+    const int status = lua_resume(co, L, nargs, &nres);
+
+    if (status == LUA_YIELD) {
+        lua_pop(co, nres);
+        lua_scheduler_yield_bump();
+        // The continuation (sleep timer slot) owns its own ref now;
+        // ours is redundant — dropping it is what keeps the registry
+        // at one slot per suspended coroutine.
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return;
+    }
+    if (status != LUA_OK) {
+        const char* err = lua_tostring(co, -1);
+        ESP_LOGE(TAG, "%s: %s", err_ctx, err ? err : "(no message)");
+        lua_scheduler_error_bump();
+    }
+    lua_pop(co, (status == LUA_OK) ? nres : 1);
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    lua_scheduler_coroutine_exit();
+}
+
+// Spawns a coroutine from the function on top of L's stack (consumed)
+// and anchors it with a fresh registry ref stored in *out_ref. Returns
+// NULL on registry exhaustion (function gone, no live-count taken).
+// Capacity checks stay at the call sites — message and control flow
+// differ per site.
+static lua_State* spawn_coroutine(lua_State* L, int* out_ref) {
+    lua_State* co = lua_newthread(L);   // [..., fn, co]
+    lua_insert(L, -2);                  // [..., co, fn]
+    lua_xmove(L, co, 1);                // fn → co. L: [..., co]
+    *out_ref = luaL_ref(L, LUA_REGISTRYINDEX);   // consumes co
+    if (*out_ref == LUA_NOREF) return NULL;
+    lua_scheduler_coroutine_enter();
+    return co;
+}
+
 static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, r->coroutine_ref);
     lua_State* co = lua_tothread(L, -1);
@@ -315,25 +386,7 @@ static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
 
     for (int i = 0; i < r->argc; ++i) lua_pushinteger(co, r->argv[i]);
 
-    int nres = 0;
-    arm_resume_deadline(co);
-    const int status = lua_resume(co, L, r->argc, &nres);
-
-    if (status == LUA_OK) {
-        lua_pop(co, nres);
-        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
-        lua_scheduler_coroutine_exit();
-    } else if (status == LUA_YIELD) {
-        lua_pop(co, nres);
-        lua_scheduler_yield_bump();
-    } else {
-        const char* err = lua_tostring(co, -1);
-        ESP_LOGE(TAG, "coroutine error: %s", err ? err : "(no message)");
-        lua_pop(co, 1);
-        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
-        lua_scheduler_coroutine_exit();
-        lua_scheduler_error_bump();
-    }
+    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error");
 }
 
 // Marshal event fields onto a coroutine's stack. Returns argc.
@@ -450,45 +503,17 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
             break;
         }
 
-        lua_State* co = lua_newthread(L);
-        // Stack now: [..., handlers_tbl, fn, co]. Reorder to
-        // [handlers_tbl, co, fn] then xmove fn onto co.
-        lua_insert(L, -2);              // [handlers_tbl, co, fn]
-        lua_xmove(L, co, 1);            // fn → co. L: [handlers_tbl, co]
+        int ref = LUA_NOREF;
+        lua_State* co = spawn_coroutine(L, &ref);   // consumes fn
+        if (!co) continue;
 
         const int argc = push_event_args(co, e);
 
-        // Hold a ref so the thread isn't GC'd while we resume.
-        lua_pushvalue(L, -1);           // duplicate thread for ref
-        const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        if (ref == LUA_NOREF) {
-            lua_pop(L, 1);              // pop thread
-            continue;
-        }
-
-        lua_scheduler_coroutine_enter();
-
         // Run the coroutine inline. Args are already on co; pass argc
-        // as nargs so Lua hands them to the function.
-        int nres = 0;
-        arm_resume_deadline(co);
-        const int status = lua_resume(co, L, argc, &nres);
-        if (status == LUA_YIELD) {
-            lua_pop(co, nres);
-            lua_scheduler_yield_bump();
-            // Ref stays live; the yield path (zhac.sleep etc.) is
-            // responsible for pushing a resume when ready.
-        } else {
-            if (status != LUA_OK) {
-                const char* err = lua_tostring(co, -1);
-                ESP_LOGE(TAG, "handler error: %s", err ? err : "(no message)");
-                lua_scheduler_error_bump();
-            }
-            lua_pop(co, (status == LUA_OK) ? nres : 1);
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            lua_scheduler_coroutine_exit();
-        }
-        lua_pop(L, 1);                   // pop thread from L
+        // as nargs so Lua hands them to the function. Our spawn ref is
+        // settled on every outcome — on yield, zhac.sleep's own ref
+        // takes over and the timer slot pushes the resume when ready.
+        resume_and_settle(L, co, ref, argc, "handler error");
     }
     lua_pop(L, 1);                       // handler table
 }
@@ -527,9 +552,9 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
         lua_pop(L, 1);                                 // drop compiled fn
         return;
     }
-    lua_State* co = lua_newthread(L);                 // [fn, co]
-    lua_insert(L, -2);                                 // [co, fn]
-    lua_xmove(L, co, 1);                               // fn → co. L: [co]
+    int ref = LUA_NOREF;
+    lua_State* co = spawn_coroutine(L, &ref);          // consumes fn
+    if (!co) return;
 
     // Push a single event-context table as the call argument. Callers
     // that only care about the stringified value still get it via
@@ -546,27 +571,9 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     lua_pushinteger(co, (lua_Integer)r->int_val);  lua_setfield(co, -2, "int_val");
     const int argc = 1;
 
-    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);    // consumes co
-    if (ref == LUA_NOREF) return;
-    lua_scheduler_coroutine_enter();
-
-    int nres = 0;
-    arm_resume_deadline(co);
-    const int status = lua_resume(co, L, argc, &nres);
-    if (status == LUA_YIELD) {
-        lua_pop(co, nres);
-        lua_scheduler_yield_bump();
-    } else {
-        if (status != LUA_OK) {
-            const char* err = lua_tostring(co, -1);
-            ESP_LOGE(TAG, "lua.run '%s' error: %s",
-                     r->name, err ? err : "(no message)");
-            lua_scheduler_error_bump();
-        }
-        lua_pop(co, (status == LUA_OK) ? nres : 1);
-        luaL_unref(L, LUA_REGISTRYINDEX, ref);
-        lua_scheduler_coroutine_exit();
-    }
+    char err_ctx[48];   // "lua.run '<name≤31>' error" — worst case 47 + NUL
+    snprintf(err_ctx, sizeof(err_ctx), "lua.run '%s' error", r->name);
+    resume_and_settle(L, co, ref, argc, err_ctx);
 }
 
 static void task_lua(void* arg) {
@@ -595,17 +602,11 @@ extern "C" int lua_scheduler_spawn(lua_State* L) {
         return LUA_NOREF;
     }
 
-    lua_State* co = lua_newthread(L);
-    // Stack now: [..., function, thread]. Move the function to the
-    // new coroutine's stack.
-    lua_pushvalue(L, -2);      // copy function
-    lua_xmove(L, co, 1);       // move to coroutine
-    lua_remove(L, -2);         // drop the original function
+    int ref = LUA_NOREF;
+    if (!spawn_coroutine(L, &ref)) return LUA_NOREF;   // consumes fn
 
-    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    if (ref == LUA_NOREF) return LUA_NOREF;
-
-    lua_scheduler_coroutine_enter();
+    // The ref rides the MSG_RESUME; resume_coroutine settles it on
+    // every outcome (resume_and_settle).
     lua_scheduler_push_resume(ref);
     return ref;
 }
