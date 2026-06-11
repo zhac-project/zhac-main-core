@@ -657,7 +657,9 @@ static bool load_one_script(lua_State* L, const char* name) {
     // ordering: once MSG_LOAD_ALL is handled, every script has run to
     // its first yield/finish, so events behind it see all handlers.
     char err_ctx[48];   // "script '<name≤24>' error" — worst case 39 + NUL
-    snprintf(err_ctx, sizeof(err_ctx), "script '%s' error", name);
+    // %.24s: cache names are char[25], but the compiler can't see that
+    // bound through the const char* param (-Werror=format-truncation).
+    snprintf(err_ctx, sizeof(err_ctx), "script '%.24s' error", name);
     resume_and_settle(L, co, ref, 0, err_ctx);
     return true;   // loaded = compiled + started; runtime errors are
                    // logged/counted by resume_and_settle, as before
