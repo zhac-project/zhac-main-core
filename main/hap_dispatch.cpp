@@ -37,6 +37,7 @@
 #include "mqtt_gw.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "nvs_checked.h"
 #include "esp_random.h"
 #include "p4_ota.h"
 #include "device_backend.h"
@@ -1115,10 +1116,20 @@ static void handle_zigbee_cfg_set(const HapFrame& f) {
                                         &new_chan,
                                         new_key, sizeof(new_key),
                                         &key_present, &regenerate)) {
+        // P1-T8: an out-of-range channel used to be silently dropped while
+        // the request was still acked ok — NAK the whole request instead
+        // (no partial write) so the S3/UI sees the rejection.
+        const bool chan_in_range = (new_chan < 0) ||  // -1 = not provided
+                                   (new_chan >= 11 && new_chan <= 26);
         nvs_handle_t h;
-        if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        if (!chan_in_range) {
+            ESP_LOGW(TAG, "ZIGBEE_CFG_SET: channel %d out of range (11-26) — NAK",
+                     new_chan);
+        } else if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) == ESP_OK) {
+            esp_err_t acc = ESP_OK;
             if (new_chan >= 11 && new_chan <= 26) {
-                nvs_set_u8(h, "channel", (uint8_t)new_chan);
+                nvs_seq(&acc, nvs_set_u8(h, "channel", (uint8_t)new_chan),
+                        TAG, "set_u8 channel");
             }
             if (regenerate) {
                 esp_fill_random(new_key, sizeof(new_key));
@@ -1126,14 +1137,19 @@ static void handle_zigbee_cfg_set(const HapFrame& f) {
                 ESP_LOGI(TAG, "ZIGBEE_CFG_SET: regenerated random network key");
             }
             if (key_present) {
-                nvs_set_blob(h, "net_key", new_key, sizeof(new_key));
+                nvs_seq(&acc, nvs_set_blob(h, "net_key", new_key, sizeof(new_key)),
+                        TAG, "set_blob net_key");
             }
-            nvs_commit(h);
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit zigbee_cfg");
             nvs_close(h);
-            ok = true;
-            ESP_LOGI(TAG, "ZIGBEE_CFG_SET: channel=%d net_key=%s "
-                          "(applies on next factory reset)",
-                     new_chan, key_present ? "updated" : "unchanged");
+            // P1-T8: NVS failures now propagate into the ack instead of
+            // unconditionally reporting ok.
+            ok = (acc == ESP_OK);
+            if (ok) {
+                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: channel=%d net_key=%s "
+                              "(applies on next factory reset)",
+                         new_chan, key_present ? "updated" : "unchanged");
+            }
         } else {
             ESP_LOGW(TAG, "ZIGBEE_CFG_SET: nvs_open failed");
         }

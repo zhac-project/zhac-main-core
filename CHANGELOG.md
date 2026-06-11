@@ -135,10 +135,21 @@ Note: the `ezsp_backend` pool call-sites are intentionally untouched —
 the component is compile-gated off (`CONFIG_ZHAC_NCP_ZNP=y`) and its
 rework is tracked in `extra/docs/EZSP_ASH_REWORK_PLAN.md`.
 
+### Fixed — High (P1 findings review, hap_dispatch NVS)
+
+- **hap_dispatch**: `handle_zigbee_cfg_set` ignored its
+  `nvs_set_u8`/`nvs_set_blob`/`nvs_commit` returns and acked `ok=true`
+  regardless (:1085 pre-fix) — a failed channel/network-key persist was
+  reported to the S3/UI as accepted. NVS errors now propagate into the
+  ack (`nvs_seq` from `zap_common/nvs_checked.h`). An out-of-range
+  channel (outside 11-26) used to be silently dropped while the request
+  was still acked ok; it now NAKs the whole request with no partial
+  write, so the caller sees the rejection (the ack still carries the
+  current stored values).
+
 ### Compatibility note
 
 - **hap_dispatch**: no protocol or behaviour change on the P4 side
   associated with the S3-side `s_p4_device_count` cleanup (HAP F-10 in
   `zhac-net-core`). The P4 already emits `pool_count_active()` in the
   HEARTBEAT payload; the S3 now treats HEARTBEAT as the single writer.
-</content>
