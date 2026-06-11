@@ -61,7 +61,9 @@ bool lua_scheduler_push_load_all(void);
 
 // Consume the function on top of `L` (the master state), wrap it in a
 // new coroutine, register it, and enqueue an initial resume. Returns
-// the registry ref or LUA_NOREF on OOM.
+// the registry ref or LUA_NOREF on OOM. NOTE: no in-tree callers since
+// MSG_LOAD_ALL (load_all now spawns inline on TaskLua); kept for
+// off-TaskLua use (mono-core port may need it) — removal candidate.
 int lua_scheduler_spawn(lua_State* L);
 
 #ifdef __cplusplus

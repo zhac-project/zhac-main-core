@@ -328,7 +328,7 @@ extern "C" bool lua_scheduler_push_load_all(void) {
 //
 //   spawn ref   taken by spawn_coroutine() (dispatch_event /
 //               run_named_script / load_one_script /
-//               lua_scheduler_spawn) to anchor the
+//               lua_scheduler_spawn (currently unused)) to anchor the
 //               fresh thread while it runs. Settled by
 //               resume_and_settle() on every outcome of the resume it
 //               drives (for lua_scheduler_spawn the ref rides a
@@ -656,7 +656,7 @@ static bool load_one_script(lua_State* L, const char* name) {
     // scripts' top-level registrations run. Inline keeps the original
     // ordering: once MSG_LOAD_ALL is handled, every script has run to
     // its first yield/finish, so events behind it see all handlers.
-    char err_ctx[48];   // "script '<name≤24>' error" — worst case 40 + NUL
+    char err_ctx[48];   // "script '<name≤24>' error" — worst case 39 + NUL
     snprintf(err_ctx, sizeof(err_ctx), "script '%s' error", name);
     resume_and_settle(L, co, ref, 0, err_ctx);
     return true;   // loaded = compiled + started; runtime errors are
@@ -696,6 +696,9 @@ static void task_lua(void* arg) {
 
 // Spawn a coroutine from a Lua function on top of L's stack. Consumes
 // the function value. Returns the registry ref, or LUA_NOREF on OOM.
+// NOTE: no in-tree callers since MSG_LOAD_ALL (load_all now spawns
+// inline on TaskLua); kept for off-TaskLua use (mono-core port may
+// need it) — removal candidate.
 extern "C" int lua_scheduler_spawn(lua_State* L) {
     if (!lua_isfunction(L, -1)) return LUA_NOREF;
     if (lua_scheduler_at_capacity()) {
