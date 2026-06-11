@@ -146,6 +146,11 @@ rework is tracked in `extra/docs/EZSP_ASH_REWORK_PLAN.md`.
   was still acked ok; it now NAKs the whole request with no partial
   write, so the caller sees the rejection (the ack still carries the
   current stored values).
+- **hap_dispatch**: polish fold — the "regenerated random network key"
+  INFO fired before `set_blob`/`commit`, claiming an outcome that could
+  still fail; reworded to intent ("generating random network key") — the
+  post-commit `net_key=updated` line remains the persisted-success
+  confirmation.
 
 ### Compatibility note
 

@@ -1134,7 +1134,10 @@ static void handle_zigbee_cfg_set(const HapFrame& f) {
             if (regenerate) {
                 esp_fill_random(new_key, sizeof(new_key));
                 key_present = true;
-                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: regenerated random network key");
+                // Intent, not outcome — this fires before set_blob/commit;
+                // the post-commit "net_key=updated" line below is the
+                // persisted-success confirmation.
+                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: generating random network key");
             }
             if (key_present) {
                 nvs_seq(&acc, nvs_set_blob(h, "net_key", new_key, sizeof(new_key)),
