@@ -59,6 +59,25 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   aborting the loop (no boot-loop from one broken file).
   (`lua_engine.c:118`, now `lua_scheduler.cpp`)
 
+- **ezsp_driver / ezsp_backend**: the experimental EZSP/ASH backend is now
+  compile-gated OFF by default. New `CONFIG_ZHAC_EZSP_BACKEND_ENABLE`
+  (default `n`) whole-TU-gates both components (same mechanism as
+  `CONFIG_HAP_BENCHMARK`) and hides `ZHAC_NCP_EZSP` in the NCP Protocol
+  choice — default builds ship none of this code. The link layer has
+  structural defects (no retransmit path, conflated ACK counters, C3/C4
+  response-pump deadlock) deferred to a full rework
+  (`extra/docs/EZSP_ASH_REWORK_PLAN.md`, workspace-local). The gated code
+  itself was made wire-safe: `ash_encode_data` rejects payloads that
+  overflow its `raw[EZSP_MAX_PAYLOAD+4]` frame buffer (a 255-byte
+  `payload_len` overflowed it by ~56 bytes), `ezsp_sreq` rejects
+  `payload_len > EZSP_MAX_PAYLOAD - 5` before building the frame, and the
+  SREQ response path no longer calls FreeRTOS APIs
+  (`xSemaphoreGive`/`Take`) or runs a ~200-byte memcpy inside
+  `portENTER_CRITICAL` — forbidden on the dual-core P4. Only the
+  match/arm decision stays under the spinlock; copy and semaphore
+  give/drain happen after `portEXIT_CRITICAL`, give strictly after the
+  copy. (`ezsp_driver.cpp:134,226,435,446`)
+
 ### Fixed — Medium (HAP stack review, 02-hap-stack.md)
 
 - **hap_dispatch**: guard every handler that uses static-local scratch

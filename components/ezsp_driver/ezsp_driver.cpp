@@ -3,6 +3,12 @@
 // components/ezsp_driver/ezsp_driver.cpp
 // EZSP/ASH driver for Silicon Labs EFR32 NCP.
 // ASH framing ported from Tasmota xdrv_23_zigbee_9_serial.ino.
+//
+// EXPERIMENTAL — whole TU is compiled out unless
+// CONFIG_ZHAC_EZSP_BACKEND_ENABLE is set (default n). Known-broken link
+// layer (F14, C3/C4); see extra/docs/EZSP_ASH_REWORK_PLAN.md.
+#include "sdkconfig.h"
+#ifdef CONFIG_ZHAC_EZSP_BACKEND_ENABLE
 #include "ezsp_driver.h"
 #include "esp_log.h"
 #include <cstring>
@@ -10,7 +16,6 @@
 #include "driver/gpio.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
 
 static const char* TAG = "ezsp_drv";
 
@@ -130,6 +135,13 @@ size_t ash_encode_data(uint8_t frame_num, uint8_t ack_num, bool retransmit,
 
     // Build unescaped frame: [ctrl] [ezsp_data (randomized)] [CRC16 MSB] [CRC16 LSB]
     uint8_t raw[EZSP_MAX_PAYLOAD + 4];
+    // Bounds: ctrl(1) + ezsp_len + CRC(2) must fit in raw[].
+    // (overflow-safe form of `ezsp_len + 3 > sizeof(raw)`)
+    if (ezsp_len > sizeof(raw) - 3) {
+        ESP_LOGE(TAG, "ASH DATA payload too long: %u > %u",
+                 (unsigned)ezsp_len, (unsigned)(sizeof(raw) - 3));
+        return 0;
+    }
     raw[0] = ctrl;
     memcpy(raw + 1, ezsp_data, ezsp_len);
     // Randomize all bytes after control byte
@@ -213,10 +225,21 @@ static void dispatch_ezsp_frame(const uint8_t* ezsp_data, size_t ezsp_len) {
     f.payload       = ezsp_data + 5;
     f.payload_len   = (uint8_t)(ezsp_len - 5);
 
-    // Check if this is a response to a pending SREQ
+    // Check if this is a response to a pending SREQ. Only the cheap match
+    // decision happens under the spinlock — FreeRTOS calls and a ~200-byte
+    // memcpy are forbidden inside portENTER_CRITICAL (it spins with
+    // interrupts masked; dual-core P4).
     portENTER_CRITICAL(&s_sreq_mux);
-    if (f.command_id == s_rsp_cmd_id) {
-        // Copy to stable buffer
+    const bool is_sreq_rsp = (f.command_id == s_rsp_cmd_id);
+    portEXIT_CRITICAL(&s_sreq_mux);
+
+    if (is_sreq_rsp) {
+        // Safe outside the lock: the waiter in ezsp_sreq() holds
+        // s_sreq_mutex and is blocked on s_rsp_sem, so nothing rearms
+        // s_rsp_cmd_id or reads s_rsp_frame until the give below; the give
+        // happens only after the copy completes. (Stale responses after an
+        // SREQ timeout can still mismatch — pre-existing defect, tracked in
+        // extra/docs/EZSP_ASH_REWORK_PLAN.md.)
         memcpy(s_rsp_buf, ezsp_data, ezsp_len);
         s_rsp_frame.sequence      = s_rsp_buf[0];
         s_rsp_frame.frame_control = (uint16_t)s_rsp_buf[1] | ((uint16_t)s_rsp_buf[2] << 8);
@@ -224,10 +247,8 @@ static void dispatch_ezsp_frame(const uint8_t* ezsp_data, size_t ezsp_len) {
         s_rsp_frame.payload       = s_rsp_buf + 5;
         s_rsp_frame.payload_len   = (uint8_t)(ezsp_len - 5);
         xSemaphoreGive(s_rsp_sem);
-        portEXIT_CRITICAL(&s_sreq_mux);
         return;
     }
-    portEXIT_CRITICAL(&s_sreq_mux);
 
     // Dispatch to registered callbacks
     for (size_t i = 0; i < s_cb_count; i++) {
@@ -424,6 +445,15 @@ EzspFrame ezsp_make_req(uint16_t command_id, const uint8_t* payload,
 }
 
 bool ezsp_sreq(const EzspFrame& req, EzspFrame& rsp_out, uint32_t timeout_ms) {
+    // Bounds: the full EZSP frame (5-byte header + payload) must stay within
+    // EZSP_MAX_PAYLOAD so ezsp_buf below and ash_encode_data's raw[] both fit.
+    if (req.payload_len > EZSP_MAX_PAYLOAD - 5) {
+        ESP_LOGE(TAG, "EZSP SREQ payload too long: %u > %u cmd=0x%04x",
+                 (unsigned)req.payload_len, (unsigned)(EZSP_MAX_PAYLOAD - 5),
+                 req.command_id);
+        return false;
+    }
+
     // Build EZSP frame bytes: seq(1) + frame_control(2) + command_id(2) + payload
     uint8_t ezsp_buf[EZSP_MAX_PAYLOAD + 8];
     ezsp_buf[0] = req.sequence;
@@ -441,10 +471,16 @@ bool ezsp_sreq(const EzspFrame& req, EzspFrame& rsp_out, uint32_t timeout_ms) {
         return false;
     }
 
+    // Arm the response matcher under the spinlock; drain any stale
+    // completion AFTER arming and outside the lock (FreeRTOS calls are
+    // forbidden inside portENTER_CRITICAL). Arm-then-drain preserves the
+    // previous ordering: once the new command id is in place a late response
+    // to a DIFFERENT previous command can no longer match, and any give it
+    // managed to post earlier is drained here before we send.
     portENTER_CRITICAL(&s_sreq_mux);
     s_rsp_cmd_id = req.command_id;
-    xSemaphoreTake(s_rsp_sem, 0);  // clear stale
     portEXIT_CRITICAL(&s_sreq_mux);
+    xSemaphoreTake(s_rsp_sem, 0);  // clear stale completion before sending
 
     // Encode ASH DATA frame and send
     uint8_t ash_buf[ASH_MAX_FRAME];
@@ -492,3 +528,5 @@ void ezsp_register_callback(uint16_t command_id, EzspCallbackFn cb) {
     }
     s_cbs[s_cb_count++] = {command_id, std::move(cb)};
 }
+
+#endif  // CONFIG_ZHAC_EZSP_BACKEND_ENABLE

@@ -11,9 +11,14 @@ menu "ZHAC Zigbee NCP Backend"
                 CC2652/CC2530 coprocessors using TI's MT serial protocol.
 
         config ZHAC_NCP_EZSP
-            bool "Silicon Labs EmberZNet (EZSP/ASH protocol)"
+            bool "Silicon Labs EmberZNet (EZSP/ASH protocol) — EXPERIMENTAL"
+            depends on ZHAC_EZSP_BACKEND_ENABLE
             help
-                EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH framing.
+                EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH
+                framing. EXPERIMENTAL, known-broken link layer (F14, C3/C4) —
+                hidden unless ZHAC_EZSP_BACKEND_ENABLE is set (Component
+                config → ZHAC EZSP NCP). Do not ship.
+                See extra/docs/EZSP_ASH_REWORK_PLAN.md.
 
         config ZHAC_NCP_C6
             bool "Espressif ESP32-C6 (ZNCP / esp-zigbee-sdk)"

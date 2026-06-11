@@ -3,6 +3,12 @@
 // components/ezsp_backend/ezsp_backend.cpp
 // EZSP DeviceBackend: coordinator init, sendUnicast, permitJoining, device pool.
 // Uses the same zigbee_pool for device storage (shared with ZNP backend).
+//
+// EXPERIMENTAL — whole TU is compiled out unless
+// CONFIG_ZHAC_EZSP_BACKEND_ENABLE is set (default n). Known-broken link
+// layer (F14, C3/C4); see extra/docs/EZSP_ASH_REWORK_PLAN.md.
+#include "sdkconfig.h"
+#ifdef CONFIG_ZHAC_EZSP_BACKEND_ENABLE
 #include "ezsp_backend.h"
 #include "ezsp_driver.h"
 #include "zigbee_mgr.h"
@@ -553,3 +559,5 @@ DeviceBackend* ezsp_backend_instance() {
 bool ezsp_backend_register() {
     return device_backend_register(&s_ezsp_backend);
 }
+
+#endif  // CONFIG_ZHAC_EZSP_BACKEND_ENABLE
