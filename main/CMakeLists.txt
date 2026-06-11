@@ -22,13 +22,19 @@ set(MAIN_REQUIRES
     app_update
     device_backend
     zhc_adapter
+    # Backend requires are unconditional ON PURPOSE. ESP-IDF expands
+    # REQUIRES in an early script-mode pass BEFORE sdkconfig is generated
+    # (build-system docs: "requirements are expanded before the
+    # configuration is loaded"), so an `if(CONFIG_ZHAC_NCP_EZSP)` here
+    # always took the else-branch on a fresh build dir and EZSP-enabled
+    # configs failed with `ezsp_backend.h: No such file or directory`.
+    # Safe to list all three always: main.cpp picks the backend via
+    # preprocessor, and the ezsp TUs are whole-TU-gated on
+    # CONFIG_ZHAC_EZSP_BACKEND_ENABLE (empty objects in ZNP builds).
+    zigbee_backend
+    ezsp_backend
+    ezsp_driver
 )
-
-if(CONFIG_ZHAC_NCP_EZSP)
-    list(APPEND MAIN_REQUIRES ezsp_backend ezsp_driver)
-else()
-    list(APPEND MAIN_REQUIRES zigbee_backend)
-endif()
 
 idf_component_register(
     SRCS "main.cpp" "hap_dispatch.cpp" "p4_ota.cpp" "test_hap_throughput.cpp"
@@ -40,4 +46,6 @@ idf_component_register(
 # build was warning-free here at IDF's default level; -Werror keeps it so.
 # (embedded-zhc already enforces this; extending -Werror to the remaining
 # first-party components is a mechanical follow-up — backlog is ~0.)
-target_compile_options(${COMPONENT_LIB} PRIVATE -Werror)
+# -Wno-error=cpp: the F14 `#warning` (EZSP backend is experimental) in
+# main.cpp must stay a loud warning in EZSP configs, not a build breaker.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Werror -Wno-error=cpp)

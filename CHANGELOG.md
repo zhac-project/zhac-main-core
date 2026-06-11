@@ -23,6 +23,15 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed — Critical (P0 findings review)
 
+- **build**: `main` now REQUIREs `zigbee_backend ezsp_backend ezsp_driver`
+  unconditionally — the previous `if(CONFIG_ZHAC_NCP_EZSP)` never fired
+  because ESP-IDF expands component requirements before sdkconfig is
+  generated, so fresh EZSP-enabled builds failed on `ezsp_backend.h`.
+  Config selection stays in the preprocessor (TU-gated ezsp sources), so
+  ZNP images carry no EZSP object code. Also `-Wno-error=cpp` so the F14
+  "EZSP is experimental" `#warning` stays loud without breaking the F17
+  `-Werror` build in EZSP configs. (`main/CMakeLists.txt`)
+
 - **lua_engine**: coroutine registry refs are now released on `LUA_YIELD`,
   not only on finish/error. `zhac.sleep` takes a FRESH registry ref on every
   call before yielding, so the ref the resumer came in with was already
