@@ -29,6 +29,23 @@ static size_t const kBudgetBytes =
 static size_t const kSmallThreshold =
     (size_t)CONFIG_LUA_ENGINE_INTERNAL_SMALL_THRESHOLD;
 
+// T20 (headroom): hold the script-visible budget a slice below the hard
+// cap so the scheduler's own per-dispatch bookkeeping — lua_newthread /
+// luaL_ref / pushstring that runs OUTSIDE any pcall frame — is far less
+// likely to hit NULL when a script has driven s_used_bytes up toward the
+// cap. Pre-T20 an alloc-fail in that unprotected window raised a Lua
+// error with no handler → lua panic → abort() → reboot per event. The
+// headroom shrinks that window (scripts get a clean `not enough memory`
+// once they cross cap-headroom); the lua_atpanic guard in
+// lua_scheduler.cpp is the backstop for any fail that still lands
+// outside a protected frame. Clamp to a positive value if the budget is
+// configured smaller than the headroom (degenerate, test-only).
+#define LUA_ALLOC_HEADROOM_BYTES (64u * 1024u)
+static size_t const kEffectiveCap =
+    (kBudgetBytes > LUA_ALLOC_HEADROOM_BYTES + 4096u)
+        ? (kBudgetBytes - LUA_ALLOC_HEADROOM_BYTES)
+        : kBudgetBytes;
+
 static inline void bump_used(size_t delta) {
     uint32_t now = atomic_fetch_add(&s_used_bytes, (uint32_t)delta) + delta;
     uint32_t peak = atomic_load(&s_peak_bytes);
@@ -75,9 +92,9 @@ void* lua_engine_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     const size_t delta = (nsize > osize) ? (nsize - osize) : 0;
     if (delta) {
         const uint32_t cur = atomic_load(&s_used_bytes);
-        if ((size_t)cur + delta > kBudgetBytes) {
-            ESP_LOGW(TAG, "budget exceeded: cur=%u delta=%zu cap=%zu",
-                     (unsigned)cur, delta, kBudgetBytes);
+        if ((size_t)cur + delta > kEffectiveCap) {
+            ESP_LOGW(TAG, "budget exceeded: cur=%u delta=%zu cap=%zu (hard=%zu)",
+                     (unsigned)cur, delta, kEffectiveCap, kBudgetBytes);
             return NULL;
         }
     }

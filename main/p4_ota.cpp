@@ -16,9 +16,20 @@
 #include "esp_app_desc.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
+
+// T20: persistence flush barriers fired before esp_restart() so an OTA
+// reboot can't discard freshly-edited rules / device state that the
+// writeback caches still hold in RAM. esp_restart() does invoke
+// registered shutdown handlers, but we call these explicitly so the
+// ordering is obvious at the OTA call site and survives any future
+// change to handler registration. Both headers declare C++-linkage
+// symbols (no extern "C"), so include them rather than re-declaring.
+#include "rule_store.h"
+#include "zap_store.h"
 
 static const char* TAG = "p4_ota";
 
@@ -33,6 +44,58 @@ static uint32_t                s_ota_total           = 0;
 // 1-2s window while S3 still has chunks in flight. Reset on chunk-0
 // begin so a fresh OTA retry can report fresh failures.
 static bool                    s_ota_failure_notified = false;
+
+// ── Idle-abort watchdog (T20) ─────────────────────────────────────────
+// If S3 starts an OTA and then stops sending (link drop, S3 reboot, user
+// cancel) the open esp_ota_handle pins flash + the staging partition
+// forever — the next OTA attempt can't begin cleanly and the handle
+// leaks. A one-shot esp_timer started on begin (and re-armed on every
+// chunk) aborts a session that sees no chunk for OTA_IDLE_TIMEOUT_US.
+// Forward decl — send_ota_status is defined below but the idle callback
+// (and the chunk handler) reference it first.
+static void send_ota_status(bool ok, uint32_t rcvd, uint32_t total, const char* err_msg);
+static constexpr int64_t OTA_IDLE_TIMEOUT_US = 60LL * 1000 * 1000;  // 60 s
+static int64_t                 s_ota_last_chunk_us = 0;
+static esp_timer_handle_t      s_ota_idle_timer    = nullptr;
+
+static void ota_idle_abort_cb(void*) {
+    if (s_ota_handle == 0) return;   // already done/aborted — nothing to do
+    const int64_t idle = esp_timer_get_time() - s_ota_last_chunk_us;
+    if (idle < OTA_IDLE_TIMEOUT_US) {
+        // A chunk arrived after the timer was armed but before it fired
+        // (the re-arm path replaces this, so this is a belt-and-braces
+        // guard). Re-check on the remaining interval.
+        esp_timer_start_once(s_ota_idle_timer, OTA_IDLE_TIMEOUT_US - idle);
+        return;
+    }
+    ESP_LOGW(TAG, "OTA idle >%llds with open session — aborting + freeing handle",
+             OTA_IDLE_TIMEOUT_US / 1000000);
+    esp_ota_abort(s_ota_handle);
+    s_ota_handle = 0;
+    s_ota_part = nullptr;
+    s_ota_expected_offset = 0;
+    send_ota_status(false, s_ota_expected_offset, s_ota_total, "idle timeout");
+}
+
+static void ota_idle_timer_rearm() {
+    s_ota_last_chunk_us = esp_timer_get_time();
+    if (!s_ota_idle_timer) {
+        const esp_timer_create_args_t args = {
+            .callback              = ota_idle_abort_cb,
+            .arg                   = nullptr,
+            .dispatch_method       = ESP_TIMER_TASK,
+            .name                  = "ota_idle",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_ota_idle_timer) != ESP_OK) return;
+    }
+    esp_timer_stop(s_ota_idle_timer);   // no-op if not running
+    esp_timer_start_once(s_ota_idle_timer, OTA_IDLE_TIMEOUT_US);
+}
+
+static void ota_idle_timer_disarm() {
+    if (s_ota_idle_timer) esp_timer_stop(s_ota_idle_timer);
+}
 
 // ── OTA helpers ───────────────────────────────────────────────────────────
 static void send_ota_status(bool ok, uint32_t rcvd, uint32_t total, const char* err_msg) {
@@ -101,7 +164,15 @@ void handle_ota_chunk(const HapFrame& f) {
             send_ota_status(false, 0, hdr->total, "no update partition");
             return;
         }
-        esp_err_t err = esp_ota_begin(s_ota_part, hdr->total, &s_ota_handle);
+        // T20: OTA_WITH_SEQUENTIAL_WRITES instead of passing the image
+        // size. Passing hdr->total makes esp_ota_begin erase the WHOLE
+        // destination partition up front — multiple seconds of synchronous
+        // flash erase on the dispatch task (hap_slave_task), long enough
+        // to stall heartbeats and risk a HAP link-dead/retry storm.
+        // SEQUENTIAL_WRITES erases lazily, one sector per write, so the
+        // cost is amortised across chunks (~a few ms per 4 KB sector) and
+        // no single call blocks the dispatcher for seconds.
+        esp_err_t err = esp_ota_begin(s_ota_part, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_begin failed: %s (total=%" PRIu32 ")",
                      esp_err_to_name(err), hdr->total);
@@ -112,6 +183,7 @@ void handle_ota_chunk(const HapFrame& f) {
         s_ota_expected_offset  = 0;
         s_ota_total            = hdr->total;
         s_ota_failure_notified = false;     // fresh begin — re-arm the notifier
+        ota_idle_timer_rearm();             // T20: arm the idle-abort watchdog
         ESP_LOGI(TAG, "OTA begin: total=%" PRIu32 " part=%s",
                  hdr->total, s_ota_part->label);
     } else if (resuming) {
@@ -122,6 +194,7 @@ void handle_ota_chunk(const HapFrame& f) {
         ESP_LOGE(TAG, "OTA offset mismatch: expected=%" PRIu32 " got=%" PRIu32 " — aborting",
                  s_ota_expected_offset, hdr->offset);
         if (s_ota_handle) { esp_ota_abort(s_ota_handle); s_ota_handle = 0; }
+        ota_idle_timer_disarm();   // T20
         s_ota_part = nullptr;
         s_ota_expected_offset = 0;
         send_ota_status(false, hdr->offset, hdr->total, "offset mismatch");
@@ -137,16 +210,19 @@ void handle_ota_chunk(const HapFrame& f) {
                      hdr->offset, (unsigned)data_len, esp_err_to_name(err),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             esp_ota_abort(s_ota_handle);
+            ota_idle_timer_disarm();   // T20
             s_ota_handle = 0; s_ota_part = nullptr; s_ota_expected_offset = 0;
             send_ota_status(false, hdr->offset, hdr->total, esp_err_to_name(err));
             return;
         }
         s_ota_expected_offset += (uint32_t)data_len;
+        ota_idle_timer_rearm();   // T20: progress — push the idle deadline out
     }
 
     uint32_t rcvd = hdr->offset + (uint32_t)data_len;
 
     if (hdr->flags & 0x01) {
+        ota_idle_timer_disarm();   // T20: terminal chunk — no more idle watch
         esp_err_t err = esp_ota_end(s_ota_handle);
         s_ota_handle = 0;
         if (err != ESP_OK) {
@@ -173,7 +249,16 @@ void handle_ota_chunk(const HapFrame& f) {
             return;
         }
         send_ota_status(true, rcvd, hdr->total, "");
-        ESP_LOGI(TAG, "OTA complete — rebooting in 2 s");
+        ESP_LOGI(TAG, "OTA complete — flushing persistence + rebooting in 2 s");
+        // T20: commit the writeback caches BEFORE the reboot. The rule
+        // store and device shadow/zap store batch edits in PSRAM and
+        // flush on a ~5 s tick or shutdown; an OTA restart that beat the
+        // tick would otherwise drop the most recent rule/name/option
+        // edits. rule_store_flush_now() gained a real flush barrier in
+        // T9. lua_script_cache writes are already durable (tmp+rename per
+        // write), so there's nothing to flush there.
+        rule_store_flush_now();
+        zap_store_flush_now();
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }

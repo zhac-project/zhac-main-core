@@ -47,7 +47,9 @@
 
 static const char* TAG = "p4_main";
 
-static constexpr uint8_t ZIGBEE_PERMIT_JOIN_STARTUP_S = 250;
+// [[maybe_unused]]: only referenced inside the CONFIG_ZHAC_PERMIT_JOIN_ON_BOOT
+// blocks (T20), so it is unused in the default (gated-off) build.
+[[maybe_unused]] static constexpr uint8_t ZIGBEE_PERMIT_JOIN_STARTUP_S = 250;
 
 // ── Log drain queue ───────────────────────────────────────────────────────
 // Captures ESP-IDF log output and forwards it to S3 via HAP LOG_LINE frames.
@@ -86,7 +88,6 @@ static void task_zigbee(void*);
 void task_hap(void*);
 static void task_event_bus(void*);
 static void task_log_drain(void*);
-static void task_wdt(void*);
 static void task_stack_mon(void*);
 static void task_buttons(void*);
 
@@ -205,7 +206,6 @@ extern "C" void app_main() {
     xTaskCreatePinnedToCore(task_hap,       "TaskHAP",       zhac::stack::kHapP4, nullptr, 4, nullptr, 0);
     xTaskCreate(             task_event_bus,"TaskEventBus",  zhac::stack::kEventBus, nullptr, 2, nullptr);
     xTaskCreate(             task_log_drain,"TaskLog",       zhac::stack::kLog, nullptr, 1, nullptr);
-    xTaskCreatePinnedToCore(task_wdt,       "TaskWDT",       zhac::stack::kWdt, nullptr, 7, nullptr, 0);
     xTaskCreate(             task_stack_mon,"TaskStackMon",  zhac::stack::kStackMonP4, nullptr, 1, nullptr);
     xTaskCreate(             task_buttons,  "TaskButtons",   zhac::stack::kButtons, nullptr, 1, nullptr);
 
@@ -239,9 +239,18 @@ static void task_zigbee(void*) {
         esp_restart();
     }
 
+    // T20: boot auto-open is now opt-in (CONFIG_ZHAC_PERMIT_JOIN_ON_BOOT,
+    // default n). Opening the network for ~250 s on EVERY boot is a
+    // standing security exposure; pairing stays available on demand via
+    // the SPA / PERMIT_JOIN message / join button.
+#if CONFIG_ZHAC_PERMIT_JOIN_ON_BOOT
     ESP_LOGI(TAG, "TaskZigbee: coordinator ready, opening permit join %u s",
              ZIGBEE_PERMIT_JOIN_STARTUP_S);
     zigbee_permit_join(ZIGBEE_PERMIT_JOIN_STARTUP_S);
+#else
+    ESP_LOGI(TAG, "TaskZigbee: coordinator ready (permit-join auto-open disabled; "
+                  "pair on demand)");
+#endif
 
     // Init done — drop priority so the crash-recovery loop doesn't waste a
     // high-priority slot during normal operation (was 5, now 2).
@@ -260,11 +269,22 @@ static void task_zigbee(void*) {
     // reboot would discard. Backoff schedule: 3 s, 6 s, 9 s, 12 s, then cap
     // at 60 s — slow enough to surface a real hardware fault in the log
     // without spinning the UART at full duty.
+    // T20: subscribe the steady-state monitor to the task watchdog. This
+    // loop cycles every 100 ms, so a wedge here (e.g. zigbee_mgr_crashed
+    // deadlocking on a pool lock) trips the 10 s WDT. We UNSUBSCRIBE
+    // around the crash-recovery backoff below — its vTaskDelay can run up
+    // to 60 s, far past the WDT window, and false-tripping a reboot
+    // mid-recovery is exactly the data loss the recovery loop exists to
+    // avoid.
+    esp_task_wdt_add(nullptr);
     while (true) {
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(100));
         if (!zigbee_mgr_crashed()) continue;
 
         ESP_LOGW(TAG, "ZNP crash detected — entering recovery loop");
+        // Recovery may block for up to 60 s/attempt — out of WDT scope.
+        esp_task_wdt_delete(nullptr);
         uint8_t attempt = 0;
         while (!zigbee_mgr_reinit()) {
             attempt++;
@@ -275,9 +295,18 @@ static void task_zigbee(void*) {
                      attempt, (unsigned)(backoff_ms / 1000));
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
         }
+        // T20: same gate as boot — don't silently reopen the network for
+        // joining after a crash recovery unless the operator opted in.
+#if CONFIG_ZHAC_PERMIT_JOIN_ON_BOOT
         ESP_LOGI(TAG, "ZNP recovery OK after %u attempt(s) — reopening permit join %u s",
                  (unsigned)(attempt + 1), ZIGBEE_PERMIT_JOIN_STARTUP_S);
         zigbee_permit_join(ZIGBEE_PERMIT_JOIN_STARTUP_S);
+#else
+        ESP_LOGI(TAG, "ZNP recovery OK after %u attempt(s) "
+                      "(permit-join auto-open disabled)", (unsigned)(attempt + 1));
+#endif
+        // Re-arm WDT coverage for the steady-state monitor.
+        esp_task_wdt_add(nullptr);
     }
 }
 
@@ -298,7 +327,9 @@ static void task_event_bus(void*) {
         EventType::RULE_TIMER_FIRE,
     };
 
+    esp_task_wdt_add(nullptr);   // T20: real WDT coverage (was tautological feeder)
     while (true) {
+        esp_task_wdt_reset();    // cycles every ≤20 ms — well within the WDT window
         uint8_t processed = 0;
         for (EventType t : ALL_TYPES) {
             processed += event_bus_drain(t, 0);
@@ -335,13 +366,21 @@ static void task_log_drain(void*) {
     }
 }
 
-static void task_wdt(void*) {
-    esp_task_wdt_add(nullptr);
-    while (true) {
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
+// T20: the old task_wdt was a tautology — a dedicated always-healthy
+// task that fed the watchdog on a fixed 1 s timer. A wedged TaskHAP /
+// TaskLua / TaskZigbee never tripped it because the feeder kept petting
+// the dog regardless. Real coverage now lives in the loops that matter:
+// each subscribes itself via esp_task_wdt_add(NULL) and resets from its
+// own iteration, so a stall in any of them actually trips the WDT.
+//   • TaskHAP      — cycles every ~10 ms (hap_session_tick + 10 ms qrecv)
+//   • TaskLua      — resets at loop head; finite (2 s) queue-recv timeout
+//                    so an idle engine still pets the dog (lua_scheduler)
+//   • TaskEventBus — cycles every ≤20 ms (drain loop + idle sleep)
+//   • TaskZigbee   — steady-state monitor cycles every 100 ms; it
+//                    UNSUBSCRIBES around the crash-recovery backoff
+//                    (delays up to 60 s) so a legitimate long backoff
+//                    can't false-trip the 10 s window.
+// The dedicated feeder task is gone.
 
 // ── Stack high-water-mark monitor (P2) ───────────────────────────────────
 // Logs free stack bytes for each named task every 60 s. Use output to

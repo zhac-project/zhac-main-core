@@ -17,11 +17,13 @@
 #if CONFIG_LUA_ENGINE_ENABLED
 
 #include <atomic>
+#include <csetjmp>
 #include <cstdint>
 #include <cstring>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -35,8 +37,52 @@ extern "C" {
 #include "lua_scheduler.h"
 }
 #include "metrics/metrics_macros.h"
+// T20: derive the ZclAttrEvent payload layout from the canonical schema
+// constants instead of hardcoded offsets. event_bus schema v6 widened
+// ATTR_KEY_MAX 20→28, which slid the value union from offset 36 to 44;
+// the old literals silently fed on_attr_change handlers 0/garbage ints
+// and truncated key/value strings. Pull the header so the offsets track
+// the struct automatically if the schema moves again.
+#include "zcl_attribute.h"
+#include "event_bus.h"
 
 static const char* TAG = "lua_sched";
+
+// ── Panic backstop (T20) ──────────────────────────────────────────────
+// The scheduler touches the VM from unprotected frames on TaskLua:
+// lua_newthread / luaL_ref / lua_pushstring in spawn_coroutine and the
+// push_event_args / run_named_script marshalling run with NO pcall above
+// them. If the budget allocator returns NULL there (script drove the
+// heap to the cap), Lua raises "not enough memory" with no handler to
+// catch it and calls the panic function — whose default is abort(), i.e.
+// every such event becomes a chip reboot.
+//
+// Fix: install a lua_atpanic handler that longjmps back to a setjmp
+// frame wrapped around each dispatch step in task_lua (the standard
+// embedded "panic = unwind one step, keep the VM" pattern). The bad
+// dispatch is abandoned and counted; TaskLua loops and serves the next
+// message. The VM stays up. NOTE: longjmp out of a panic leaves the
+// offending lua_State's stack unbalanced, but we only ever longjmp on a
+// genuinely unrecoverable raise (OOM/internal) where that thread is
+// being discarded anyway — g_L itself is not left mid-API-call because
+// the panic fires synchronously inside the C API call we abandon.
+static std::jmp_buf s_panic_jmp;
+static volatile bool s_panic_armed = false;
+
+static int lua_panic_handler(lua_State* L) {
+    const char* msg = lua_tostring(L, -1);
+    ESP_LOGE(TAG, "lua panic (unprotected error) — abandoning dispatch step: %s",
+             msg ? msg : "(no message)");
+    lua_scheduler_error_bump();
+    if (s_panic_armed) {
+        s_panic_armed = false;
+        std::longjmp(s_panic_jmp, 1);   // unwind to task_lua's per-step frame
+    }
+    // No frame armed (shouldn't happen on TaskLua) — fall through to the
+    // default behaviour (abort) rather than returning, which Lua treats
+    // as "panic handler returned" and aborts anyway.
+    return 0;
+}
 
 // ── CPU runaway guard (LUA-F1) ────────────────────────────────────────
 // Single-threaded TaskLua ⇒ one tight loop wedges every coroutine and
@@ -130,8 +176,11 @@ typedef struct {
 typedef struct {
     char     name[32];            // script identifier (no extension)
     char     value[64];           // stringified trigger value; "" when unused
-    char     key[20];             // attr name; "" for non-attr triggers
-    char     str_val[32];         // raw VAL_STR value; "" otherwise
+    // T20: size key/str_val from the schema-v6 constants, not the old
+    // 20/32 literals — an attr key up to ATTR_KEY_MAX or a VAL_STR up to
+    // ATTR_STR_MAX was being truncated before reaching the handler.
+    char     key[ATTR_KEY_MAX];   // attr name; "" for non-attr triggers
+    char     str_val[ATTR_STR_MAX]; // raw VAL_STR value; "" otherwise
     uint64_t ieee;                // source device IEEE; 0 when absent
     uint16_t cluster;             // ZCL cluster id; 0 when absent
     uint16_t attr_id;             // ZCL attribute id; 0 when absent
@@ -205,8 +254,15 @@ static void on_timer_fire(void* arg) {
     // and pin a timer slot + coroutine forever. Keep the slot and re-arm to
     // retry shortly; the ref rides along in the slot until TaskLua drains.
     if (xQueueSend(s_resume_q, &m, 0) == pdTRUE) {
-        slot->in_use        = false;
+        // T20 (slot store order): clear coroutine_ref BEFORE releasing
+        // in_use. on_timer_fire runs on the esp_timer task while
+        // slot_acquire runs on TaskLua; if in_use dropped first, a
+        // cross-task slot_acquire between the two stores would write the
+        // new ref and then this store would clobber it back to -1,
+        // orphaning the freshly-parked coroutine. Ref-then-flag closes
+        // the window (the slot isn't claimable until in_use is false).
         slot->coroutine_ref = -1;
+        slot->in_use        = false;
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
@@ -425,15 +481,21 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_newtable(co);
             return 1;
         case LUA_EVT_ATTR: {
-            // ZclAttrEvent layout (packed, 96 B): ieee(8), nwk(2), ep(1),
-            // val_type(1), cluster(2), attr_id(2), key[20], union{int32
-            // or str[32]}, pad.
+            // ZclAttrEvent layout (packed, 96 B, schema v6): ieee(8),
+            // nwk(2), ep(1), val_type(1), cluster(2), attr_id(2),
+            // key[ATTR_KEY_MAX=28], union{int32_t int_val | char
+            // str_val[ATTR_STR_MAX=48]}, _pad(4). T20: read every field
+            // through offsetof on the canonical struct so the value union
+            // is at offset 44 (v6) — the previous hardcoded 36 was the v5
+            // offset (key was [20]) and fed handlers garbage after the
+            // schema widened. The struct is the single source of truth.
             const uint8_t* p = e->payload;
-            uint64_t ieee;    memcpy(&ieee, p + 0, 8);
-            uint16_t cluster; memcpy(&cluster, p + 12, 2);
-            uint16_t attr_id; memcpy(&attr_id, p + 14, 2);
-            const char* key = (const char*)(p + 16);
-            const uint8_t val_type = p[11];
+            uint64_t ieee;    memcpy(&ieee,    p + offsetof(ZclAttrEvent, ieee),    8);
+            uint16_t cluster; memcpy(&cluster, p + offsetof(ZclAttrEvent, cluster), 2);
+            uint16_t attr_id; memcpy(&attr_id, p + offsetof(ZclAttrEvent, attr_id), 2);
+            const char* key = (const char*)(p + offsetof(ZclAttrEvent, key));
+            const uint8_t val_type = p[offsetof(ZclAttrEvent, val_type)];
+            const size_t  val_off  = offsetof(ZclAttrEvent, int_val);  // == str_val (union)
             // val_type: 0=INT, 1=BOOL, 2=STR (see attr_keys.h).
             char ieee_hex[20];
             snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
@@ -441,12 +503,12 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_pushstring(co, ieee_hex);
             lua_pushstring(co, key);
             if (val_type == 2) {
-                lua_pushstring(co, (const char*)(p + 36));
+                lua_pushstring(co, (const char*)(p + val_off));
             } else if (val_type == 1) {
-                int32_t v; memcpy(&v, p + 36, 4);
+                int32_t v; memcpy(&v, p + val_off, 4);
                 lua_pushboolean(co, v != 0);
             } else {
-                int32_t v; memcpy(&v, p + 36, 4);
+                int32_t v; memcpy(&v, p + val_off, 4);
                 lua_pushinteger(co, v);
             }
             lua_pushinteger(co, cluster);
@@ -546,8 +608,11 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
 // val_type, int_val, str_val}); fields are zero / "" for non-device
 // triggers. Returns after the coroutine either yields or terminates.
 static void run_named_script(lua_State* L, const RunNamedArgs* r) {
-    // 8 KB script source scratch lives in PSRAM. Lazy one-shot init.
-    constexpr size_t kBufSz = 8192;
+    // Script source scratch lives in PSRAM. Lazy one-shot init. T20:
+    // size to LUA_SCRIPT_SRC_MAX (+1 NUL) — the unified store cap — so a
+    // legitimately large stored script isn't silently truncated at an 8
+    // KB buffer that was smaller than the write limit.
+    constexpr size_t kBufSz = LUA_SCRIPT_SRC_MAX + 1;
     static char* buf = nullptr;
     if (!buf) {
         buf = static_cast<char*>(
@@ -613,9 +678,11 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
 // gets its own coroutine so an error or `zhac.sleep` in one script
 // doesn't block the others.
 static bool load_one_script(lua_State* L, const char* name) {
-    // Park 16 KB script-load scratch in PSRAM. One-shot lazy init,
-    // never freed — same lifetime as the original BSS-static array.
-    constexpr size_t kBufSz = 16 * 1024;
+    // Park script-load scratch in PSRAM. One-shot lazy init, never freed
+    // — same lifetime as the original BSS-static array. T20: size from
+    // LUA_SCRIPT_SRC_MAX (+1 NUL), the unified store cap (was a bare
+    // 16 KB literal).
+    constexpr size_t kBufSz = LUA_SCRIPT_SRC_MAX + 1;
     static char* buf = nullptr;
     if (!buf) {
         buf = static_cast<char*>(
@@ -681,9 +748,34 @@ static void load_all_scripts(lua_State* L) {
 static void task_lua(void* arg) {
     lua_State* L = (lua_State*)arg;
     ESP_LOGI(TAG, "TaskLua started");
+    // T20: real watchdog coverage. esp_task_wdt_add(NULL) subscribes
+    // THIS task; the loop resets it every iteration. The receive timeout
+    // (below) keeps the period under the configured WDT window even when
+    // the engine is idle, so a genuinely wedged TaskLua (tight in-C loop,
+    // deadlock) trips the WDT while normal idle never false-trips.
+    esp_task_wdt_add(nullptr);
     LuaMsg m;
     for (;;) {
-        if (xQueueReceive(s_resume_q, &m, portMAX_DELAY) != pdTRUE) continue;
+        // T20: feed the task watchdog from the loop head. The receive
+        // below uses a finite timeout (not portMAX_DELAY) so an idle
+        // engine still wakes periodically to pet the WDT instead of
+        // looking wedged. main.cpp subscribes TaskLua to the TWDT.
+        esp_task_wdt_reset();
+        if (xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(2000)) != pdTRUE) continue;
+
+        // T20 (panic backstop): wrap every VM-touching dispatch step in a
+        // setjmp frame so an unprotected OOM/internal raise (e.g. inside
+        // lua_newthread / luaL_ref / pushstring, which run with no pcall
+        // above them) longjmps here via lua_panic_handler instead of
+        // abort()ing the chip. On a panic we just drop this one message
+        // and loop — the engine survives a single bad dispatch.
+        if (setjmp(s_panic_jmp) != 0) {
+            // Returned from a panic longjmp — step already logged/counted.
+            s_panic_armed = false;
+            continue;
+        }
+        s_panic_armed = true;
+
         if (m.kind == MSG_RESUME) {
             resume_coroutine(L, &m.resume);
         } else if (m.kind == MSG_EVENT) {
@@ -693,6 +785,8 @@ static void task_lua(void* arg) {
         } else if (m.kind == MSG_LOAD_ALL) {
             load_all_scripts(L);
         }
+
+        s_panic_armed = false;
     }
 }
 
@@ -725,6 +819,11 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
         ESP_LOGE(TAG, "resume queue create failed");
         return false;
     }
+
+    // T20: route VM panics (unprotected raises — OOM at the budget cap,
+    // internal errors) through our handler so they unwind to task_lua's
+    // per-step setjmp frame instead of abort()ing the chip.
+    lua_atpanic(L, lua_panic_handler);
 
     BaseType_t ok = xTaskCreate(task_lua, "TaskLua",
                                  CONFIG_LUA_ENGINE_TASK_STACK_BYTES,

@@ -512,10 +512,16 @@ static void handle_set_attribute(const HapFrame& req) {
                                          static_cast<int32_t>(attr.val));
     }
 
-    if (!sent) {
-        if (hap_json_encode_set_ack(tx_buf, sizeof(tx_buf), &len, attr.ieee, ok)) {
-            hap_send(HapMsgType::SET_ACK, tx_buf, len, HAP_FLAG_NEEDS_ACK, req.seq);
-        }
+    // T20 (pairs with T14): ALWAYS send SET_ACK, including on the adapter
+    // (zhc tz_converter) path. The `sent` flag used to suppress the ACK
+    // when the adapter path handled the write, but the adapter path emits
+    // a Zigbee command — NOT a HAP reply — so suppressing it left S3's
+    // seq-correlated waiter to time out on every adapter-routed SET. The
+    // ack carries `ok` so S3 still learns success/failure; there is no
+    // separate adapter-path reply to double up with.
+    (void)sent;
+    if (hap_json_encode_set_ack(tx_buf, sizeof(tx_buf), &len, attr.ieee, ok)) {
+        hap_send(HapMsgType::SET_ACK, tx_buf, len, HAP_FLAG_NEEDS_ACK, req.seq);
     }
 }
 
@@ -696,8 +702,20 @@ static void handle_device_set_name(const HapFrame& f) {
 }
 
 static void handle_time_sync(const HapFrame& f) {
+    // T20: reject implausible timestamps. A ts before 2020-01-01 UTC
+    // (1577836800) is almost certainly 0 / garbage from an S3 that hasn't
+    // itself acquired time yet; accepting it would set the P4 clock to
+    // ~1970 and break every cron rule (next-fire computed from a bogus
+    // wall clock) until the next good sync. Hold the previous time
+    // instead — cron keeps using whatever monotonic baseline it had.
+    static constexpr uint32_t kMinValidTs = 1577836800u;  // 2020-01-01T00:00:00Z
     uint32_t ts = 0;
     if (hap_json_decode_time_sync(f.payload, f.payload_len, &ts)) {
+        if (ts < kMinValidTs) {
+            ESP_LOGW(TAG, "TIME_SYNC rejected implausible ts=%lu (< 2020-01-01)",
+                     (unsigned long)ts);
+            return;
+        }
         struct timeval tv{ .tv_sec = (time_t)ts, .tv_usec = 0 };
         settimeofday(&tv, nullptr);
         ESP_LOGI(TAG, "System time set: ts=%lu", (unsigned long)ts);
@@ -915,10 +933,20 @@ static void handle_script_read_req(const HapFrame& f) {
 
 static void handle_permit_join(const HapFrame& f) {
     uint8_t dur = 0;
-    if (hap_json_decode_permit_join(f.payload, f.payload_len, &dur))
+    if (hap_json_decode_permit_join(f.payload, f.payload_len, &dur)) {
+        // T20: clamp to ≤254. Per ZDO Mgmt_Permit_Joining, duration 0xFF
+        // (255) means "permanently open" — a foot-gun if the SPA ever
+        // sends 255 (intending "max"), leaving the network open to
+        // joining forever with no auto-close. 254 s is the longest
+        // bounded window; 0 still closes.
+        if (dur == 255) {
+            ESP_LOGW(TAG, "PERMIT_JOIN 255 (permanent) clamped to 254 s");
+            dur = 254;
+        }
         zigbee_permit_join(dur);
-    else
+    } else {
         ESP_LOGW(TAG, "PERMIT_JOIN decode failed");
+    }
 }
 
 static void handle_bind_req(const HapFrame& f) {
@@ -1025,16 +1053,53 @@ static void handle_interview_req(const HapFrame& f) {
 // from the pool. Payload shape is identical to INTERVIEW_REQ so the
 // same JSON decoder works for both.
 //
-// Releases the pool lock before invoking `zhac_adapter_configure` —
-// the call issues radio frames that can block on AF_DATA_CONFIRM for
-// ~2.5 s; holding the pool mutex would stall every other device
-// dispatching attrs simultaneously.
+// ── CONFIGURE offload worker (T20) ────────────────────────────────────
+// `zhac_adapter_configure` issues a pipeline of radio frames, each of
+// which can block on AF_DATA_CONFIRM for up to ~2.5 s. Run synchronously
+// in the CONFIGURE_REQ handler that meant the HAP dispatcher
+// (hap_slave_task) sat blocked for seconds per device — long enough that
+// heartbeats stall and the link can be declared dead. The dispatcher
+// must never block >50 ms.
+//
+// CONFIGURE_REQ is a fire-and-forget message (hap_protocol.h: no
+// CONFIGURE_ACK/NAK type exists, and S3 awaits no reply — the configure
+// result reaches S3 through the normal attr-report path as the device
+// responds). So the fix is purely to MOVE the blocking call off the
+// dispatch task: the handler decodes + snapshots under the pool lock,
+// enqueues the work, and returns immediately. A dedicated low-priority
+// cfg_worker task drains the queue and runs the blocking configure. On
+// queue-full we log and drop (configure is rare and user-retriable);
+// there is no NAK frame to send.
+struct CfgWorkItem {
+    uint64_t ieee;
+    uint16_t nwk;
+    char     model[64];   // > ZapDevice::model_id (~34 B); -Wformat-truncation headroom
+    char     manu[64];
+};
+static QueueHandle_t s_cfg_worker_q = nullptr;
+
+static void cfg_worker_task(void*) {
+    ESP_LOGI(TAG, "cfg_worker started");
+    CfgWorkItem it;
+    for (;;) {
+        if (xQueueReceive(s_cfg_worker_q, &it, portMAX_DELAY) != pdTRUE) continue;
+        const bool ok = zhac_adapter_configure(it.ieee, it.nwk, it.model, it.manu);
+        ESP_LOGI(TAG, "CONFIGURE ieee=0x%016llx model=%s -> %s",
+                 (unsigned long long)it.ieee, it.model, ok ? "ok" : "fail");
+        // No HAP reply: CONFIGURE_REQ is fire-and-forget. The resulting
+        // attr reports flow to S3 via on_zcl_attr_for_hap as the device
+        // answers the reconfigured reports/reads.
+    }
+}
+
 static void handle_configure_req(const HapFrame& f) {
     uint64_t ieee = 0;
     if (!hap_json_decode_interview_req(f.payload, f.payload_len, &ieee)) {
         ESP_LOGW(TAG, "CONFIGURE_REQ decode failed");
         return;
     }
+    CfgWorkItem it{};
+    // Snapshot identity under the pool lock — fast, no radio I/O here.
     zigbee_pool_lock();
     const ZapDevice* dev = pool_find_by_ieee(ieee);
     if (!dev || dev->model_id[0] == '\0') {
@@ -1043,19 +1108,21 @@ static void handle_configure_req(const HapFrame& f) {
                  (unsigned long long)ieee);
         return;
     }
-    const uint64_t ieee_cp = dev->ieee_addr;
-    const uint16_t nwk_cp  = dev->nwk_addr;
-    // Buffers sized to comfortably exceed ZapDevice::model_id /
-    // manufacturer_name (~34 B each) — anything smaller trips
-    // -Werror=format-truncation.
-    char model_cp[64], manu_cp[64];
-    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
+    it.ieee = dev->ieee_addr;
+    it.nwk  = dev->nwk_addr;
+    snprintf(it.model, sizeof(it.model), "%s", dev->model_id);
+    snprintf(it.manu,  sizeof(it.manu),  "%s", dev->manufacturer_name);
     zigbee_pool_unlock();
 
-    const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp, model_cp, manu_cp);
-    ESP_LOGI(TAG, "CONFIGURE_REQ ieee=0x%016llx model=%s -> %s",
-             (unsigned long long)ieee_cp, model_cp, ok ? "ok" : "fail");
+    // Hand off to the worker; the blocking ~2.5 s/step run happens there,
+    // NOT on the dispatch task. Return immediately so the dispatcher stays
+    // responsive (<50 ms). Drop on queue-full — configure is rare and the
+    // SPA button is user-retriable; no NAK frame exists to signal busy.
+    if (!s_cfg_worker_q ||
+        xQueueSend(s_cfg_worker_q, &it, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "CONFIGURE_REQ ieee=0x%016llx dropped — worker busy",
+                 (unsigned long long)it.ieee);
+    }
 }
 
 static void handle_device_options_set(const HapFrame& f) {
@@ -1318,6 +1385,17 @@ void task_hap(void*) {
     s_hap_tx_q = xQueueCreate(HAP_TX_QUEUE_DEPTH, sizeof(HapTxItem));
     configASSERT(s_hap_tx_q);
 
+    // T20: CONFIGURE offload. Shallow queue (configure is rare; depth 4
+    // is plenty of slack) + a dedicated worker so the ~2.5 s/step radio
+    // pipeline never runs on this dispatch task. Created before the
+    // session is wired so a CONFIGURE_REQ arriving immediately has a
+    // queue to land in. kZbConfigure is the established configure-pipeline
+    // stack size.
+    s_cfg_worker_q = xQueueCreate(4, sizeof(CfgWorkItem));
+    configASSERT(s_cfg_worker_q);
+    xTaskCreate(cfg_worker_task, "cfg_worker",
+                zhac::stack::kZbConfigure, nullptr, 4, nullptr);
+
     // P-F2: register handlers from the table.
     for (const auto& row : kHapHandlers) {
         s_hap_handlers[static_cast<uint8_t>(row.type)] = row.fn;
@@ -1359,7 +1437,18 @@ void task_hap(void*) {
 
     TickType_t last_hb   = xTaskGetTickCount();
 
+    // T20: real task-watchdog coverage for the HAP TX/tick loop. This
+    // loop cycles every ≤10 ms (the qrecv timeout paces it), so a wedge
+    // here trips the 10 s WDT instead of being masked by the old
+    // always-healthy feeder task. The frame DISPATCHER itself runs in
+    // hap_slave_task (component-owned); the two former multi-second
+    // dispatch blockers — CONFIGURE and the OTA upfront erase — are now
+    // offloaded / sequential (see handle_configure_req + p4_ota.cpp) so
+    // the dispatcher no longer stalls for seconds.
+    esp_task_wdt_add(nullptr);
+
     while (true) {
+        esp_task_wdt_reset();
         // Tick session every 10 ms for retransmit checks
         hap_session_tick();
 

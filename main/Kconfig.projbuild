@@ -75,6 +75,23 @@ menu "ZHAC Zigbee NCP Backend"
     endmenu
 endmenu
 
+menu "ZHAC Zigbee Commissioning"
+    config ZHAC_PERMIT_JOIN_ON_BOOT
+        bool "Auto-open permit-join on boot and after ZNP recovery"
+        default n
+        help
+            When enabled, the coordinator automatically opens the Zigbee
+            network for joining for ~250 s every time it boots, and again
+            after a ZNP crash-recovery. This is convenient for a first
+            setup but is a standing security exposure: any device can
+            join unattended during that window on every power cycle.
+
+            Default OFF (T20). Pairing remains fully available on demand
+            via the SPA "permit join" control / the PERMIT_JOIN HAP
+            message / the physical join button — only the automatic open
+            at boot/recovery is gated by this option.
+endmenu
+
 menu "ZHAC HAP Diagnostics"
     config HAP_BENCHMARK
         bool "Enable HAP throughput benchmark task"

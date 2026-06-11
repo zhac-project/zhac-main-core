@@ -161,6 +161,94 @@ rework is tracked in `extra/docs/EZSP_ASH_REWORK_PLAN.md`.
   post-commit `net_key=updated` line remains the persisted-success
   confirmation.
 
+### Fixed — High/Medium (P2 findings review, T20 — P4 dispatch/OTA + Lua)
+
+- **lua_engine**: `on_attr_change` handlers received **0 / garbage ints
+  and truncated key/value strings** since event_bus schema v6. The Lua
+  event-arg unpacker read the value union at a hardcoded offset 36 (the
+  v5 layout, when `key` was 20 B) and sized the named-trigger struct
+  `key`/`str_val` at 20/32 — but v6 widened `ATTR_KEY_MAX` 20→28 and
+  `ATTR_STR_MAX` 32→48, sliding the value union to offset 44. The
+  `LUA_EVT_ATTR` marshalling now derives every field offset from
+  `offsetof(ZclAttrEvent, …)` against the canonical `zcl_attribute.h` /
+  `event_bus.h` structs (no literals left), so the layout tracks the
+  schema automatically; `RunNamedArgs.key`/`.str_val` are sized from
+  `ATTR_KEY_MAX`/`ATTR_STR_MAX`. (`lua_scheduler.cpp` `push_event_args`
+  + `RunNamedArgs`)
+- **lua_engine**: installed a `lua_atpanic` backstop so an unprotected
+  out-of-memory raise no longer reboots the chip. The scheduler touches
+  the VM (`lua_newthread`/`luaL_ref`/`lua_pushstring`) from frames with no
+  `pcall` above them; when the budgeted allocator returned NULL at the cap
+  there, Lua's default panic = `abort()` → every such event became a
+  reboot. The panic handler now `longjmp`s to a `setjmp` frame wrapped
+  around each dispatch step in `task_lua` — the bad step is abandoned and
+  counted, the engine survives. Paired with a 64 KB allocator headroom
+  reserve (`lua_alloc.c`) so the scheduler's own bookkeeping is far less
+  likely to hit NULL mid-dispatch. (`lua_scheduler.cpp`, `lua_alloc.c`)
+- **lua_engine**: `on_timer_fire` cleared the timer slot's `in_use` flag
+  BEFORE its `coroutine_ref`; a cross-task `slot_acquire` (TaskLua) landing
+  between the two stores could write a fresh ref that this store then
+  clobbered to -1, orphaning the newly-parked coroutine. Now clears
+  `coroutine_ref` first, so the slot is never claimable with a stale ref.
+  (`lua_scheduler.cpp:on_timer_fire`)
+- **lua_engine**: script cache hardening. The read path now `stat`s the
+  file first and FAILs (rather than silently truncating at the buffer cap)
+  if a stored script is larger than the destination — an oversize file no
+  longer half-compiles and runs the wrong code. The write path now checks
+  `fflush` AND `fclose` returns BEFORE the tmp→final rename, so a
+  SPIFFS-full flush failure can't promote a truncated `.tmp` into place
+  reporting success. Source-size caps unified under one
+  `LUA_SCRIPT_SRC_MAX` (was divergent 8 KB / 16 KB literals across the
+  write limit and the two read buffers). (`lua_script_cache.cpp`,
+  `lua_engine_scripts.h`, `lua_scheduler.cpp`)
+- **hap_dispatch**: `CONFIGURE_REQ` no longer blocks the HAP dispatcher.
+  `zhac_adapter_configure` runs a radio pipeline that blocks ~2.5 s/step
+  on AF_DATA_CONFIRM; running it synchronously on the dispatch task stalled
+  heartbeats long enough to risk a link-dead/retry storm. The handler now
+  snapshots the device identity under the pool lock and enqueues the work
+  to a dedicated low-priority `cfg_worker` task, returning immediately
+  (CONFIGURE_REQ is fire-and-forget per `hap_protocol.h` — no ACK type
+  exists and the configure result still reaches S3 via the normal
+  attr-report path). On queue-full the request is logged + dropped
+  (user-retriable). (`hap_dispatch.cpp:handle_configure_req` + `task_hap`)
+- **p4_ota**: OTA flashing no longer multi-second-stalls the dispatcher.
+  `esp_ota_begin` now uses `OTA_WITH_SEQUENTIAL_WRITES` (lazy per-write
+  sector erase) instead of passing the image size, which forced a
+  whole-partition erase up front. Added a 60 s idle-abort watchdog
+  (`esp_timer`) that frees an abandoned OTA session/handle if S3 stops
+  sending, and a persistence flush (`rule_store_flush_now` +
+  `zap_store_flush_now`) before `esp_restart()` so an OTA reboot can't drop
+  freshly-edited rules/device state still in the writeback caches.
+  (`p4_ota.cpp`)
+- **main / watchdog**: replaced the tautological task-watchdog feeder (a
+  dedicated always-healthy task that pet the dog regardless of whether the
+  real loops were alive) with genuine coverage. `TaskHAP`, `TaskLua`, and
+  `TaskEventBus` now subscribe themselves (`esp_task_wdt_add`) and reset
+  from their own iterations; `TaskLua` uses a finite (2 s) queue-receive
+  timeout so an idle engine still pets the dog. `TaskZigbee` is covered in
+  its 100 ms steady-state monitor but UNSUBSCRIBES around the
+  crash-recovery backoff (delays up to 60 s) so a legitimate long backoff
+  can't false-trip the 10 s window. (`main.cpp`, `hap_dispatch.cpp`,
+  `lua_scheduler.cpp`)
+- **main / security**: the boot-time permit-join auto-open (~250 s on
+  every boot AND after every ZNP recovery) is now gated behind
+  `CONFIG_ZHAC_PERMIT_JOIN_ON_BOOT` (default **n**). Opening the network
+  for joining unattended on every power cycle was a standing exposure;
+  pairing remains available on demand via the SPA / `PERMIT_JOIN` message /
+  join button. (`main.cpp`, `main/Kconfig.projbuild`)
+- **hap_dispatch**: `SET_ATTRIBUTE` now ALWAYS sends `SET_ACK`, including on
+  the zhc-adapter (`tz_converter`) path. The previous `if (!sent)` guard
+  suppressed the ack when the adapter handled the write — but the adapter
+  path emits a Zigbee command, not a HAP reply, so S3's seq-correlated
+  waiter timed out on every adapter-routed SET (pairs with T14).
+  (`hap_dispatch.cpp:handle_set_attribute`)
+- **hap_dispatch**: `PERMIT_JOIN` duration is clamped to ≤254 — 255 is
+  "permanently open" per ZDO Mgmt_Permit_Joining and would leave the
+  network open with no auto-close. `TIME_SYNC` now rejects timestamps
+  before 2020-01-01 UTC (0/garbage from an S3 that hasn't acquired time);
+  accepting them set the clock to ~1970 and broke every cron rule.
+  (`hap_dispatch.cpp:handle_permit_join`, `handle_time_sync`)
+
 ### Compatibility note
 
 - **hap_dispatch**: no protocol or behaviour change on the P4 side
