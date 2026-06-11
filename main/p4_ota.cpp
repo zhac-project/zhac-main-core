@@ -73,8 +73,11 @@ static void ota_idle_abort_cb(void*) {
     esp_ota_abort(s_ota_handle);
     s_ota_handle = 0;
     s_ota_part = nullptr;
+    // Capture progress BEFORE zeroing so the abort status frame reports the
+    // real byte count received, not 0.
+    const uint32_t rcvd = s_ota_expected_offset;
     s_ota_expected_offset = 0;
-    send_ota_status(false, s_ota_expected_offset, s_ota_total, "idle timeout");
+    send_ota_status(false, rcvd, s_ota_total, "idle timeout");
 }
 
 static void ota_idle_timer_rearm() {

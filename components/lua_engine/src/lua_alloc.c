@@ -40,7 +40,7 @@ static size_t const kSmallThreshold =
 // lua_scheduler.cpp is the backstop for any fail that still lands
 // outside a protected frame. Clamp to a positive value if the budget is
 // configured smaller than the headroom (degenerate, test-only).
-#define LUA_ALLOC_HEADROOM_BYTES (64u * 1024u)
+static const size_t LUA_ALLOC_HEADROOM_BYTES = 64u * 1024u;
 static size_t const kEffectiveCap =
     (kBudgetBytes > LUA_ALLOC_HEADROOM_BYTES + 4096u)
         ? (kBudgetBytes - LUA_ALLOC_HEADROOM_BYTES)
