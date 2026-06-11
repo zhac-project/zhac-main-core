@@ -15,10 +15,12 @@ menu "ZHAC Zigbee NCP Backend"
             depends on ZHAC_EZSP_BACKEND_ENABLE
             help
                 EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH
-                framing. EXPERIMENTAL, known-broken link layer (F14, C3/C4) —
-                hidden unless ZHAC_EZSP_BACKEND_ENABLE is set (Component
+                framing. EXPERIMENTAL, known-broken link layer: the response
+                pump is never serviced while a request waits, so requests are
+                guaranteed to time out, and there is no ASH retransmit path.
+                Hidden unless ZHAC_EZSP_BACKEND_ENABLE is set (Component
                 config → ZHAC EZSP NCP). Do not ship.
-                See extra/docs/EZSP_ASH_REWORK_PLAN.md.
+                See extra/docs/EZSP_ASH_REWORK_PLAN.md (workspace-local).
 
         config ZHAC_NCP_C6
             bool "Espressif ESP32-C6 (ZNCP / esp-zigbee-sdk)"

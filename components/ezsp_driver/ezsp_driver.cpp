@@ -33,6 +33,9 @@ static constexpr gpio_num_t  EZSP_PIN_NRESET = GPIO_NUM_28;
 static constexpr uart_port_t EZSP_UART    = UART_NUM_1;
 static constexpr int         UART_BUF_SZ  = 4096;
 
+// EZSP frame header: sequence(1) + frame_control(2) + command_id(2).
+static constexpr size_t EZSP_HEADER_LEN = 5;
+
 // ── ASH state ────────────────────────────────────────────────────────────
 static uint8_t s_tx_frame_num = 0;   // DATA frame counter (0-7)
 static uint8_t s_rx_ack_num   = 0;   // expected ACK number from NCP
@@ -237,9 +240,13 @@ static void dispatch_ezsp_frame(const uint8_t* ezsp_data, size_t ezsp_len) {
         // Safe outside the lock: the waiter in ezsp_sreq() holds
         // s_sreq_mutex and is blocked on s_rsp_sem, so nothing rearms
         // s_rsp_cmd_id or reads s_rsp_frame until the give below; the give
-        // happens only after the copy completes. (Stale responses after an
-        // SREQ timeout can still mismatch — pre-existing defect, tracked in
-        // extra/docs/EZSP_ASH_REWORK_PLAN.md.)
+        // happens only after the copy completes. (After an SREQ timeout
+        // this is racy: match and copy+give are no longer one atomic
+        // section, so a stale response can match the old id — or post its
+        // give after the next caller's arm+drain and satisfy that wait
+        // with this stale frame. Same-id mismatch is pre-existing; the
+        // drain-bypass window is an accepted cost of the lock narrowing.
+        // Tracked in extra/docs/EZSP_ASH_REWORK_PLAN.md.)
         memcpy(s_rsp_buf, ezsp_data, ezsp_len);
         s_rsp_frame.sequence      = s_rsp_buf[0];
         s_rsp_frame.frame_control = (uint16_t)s_rsp_buf[1] | ((uint16_t)s_rsp_buf[2] << 8);
@@ -445,11 +452,12 @@ EzspFrame ezsp_make_req(uint16_t command_id, const uint8_t* payload,
 }
 
 bool ezsp_sreq(const EzspFrame& req, EzspFrame& rsp_out, uint32_t timeout_ms) {
-    // Bounds: the full EZSP frame (5-byte header + payload) must stay within
+    // Bounds: the full EZSP frame (header + payload) must stay within
     // EZSP_MAX_PAYLOAD so ezsp_buf below and ash_encode_data's raw[] both fit.
-    if (req.payload_len > EZSP_MAX_PAYLOAD - 5) {
+    if (req.payload_len > EZSP_MAX_PAYLOAD - EZSP_HEADER_LEN) {
         ESP_LOGE(TAG, "EZSP SREQ payload too long: %u > %u cmd=0x%04x",
-                 (unsigned)req.payload_len, (unsigned)(EZSP_MAX_PAYLOAD - 5),
+                 (unsigned)req.payload_len,
+                 (unsigned)(EZSP_MAX_PAYLOAD - EZSP_HEADER_LEN),
                  req.command_id);
         return false;
     }
@@ -462,8 +470,8 @@ bool ezsp_sreq(const EzspFrame& req, EzspFrame& rsp_out, uint32_t timeout_ms) {
     ezsp_buf[3] = req.command_id & 0xFF;
     ezsp_buf[4] = (req.command_id >> 8) & 0xFF;
     if (req.payload_len > 0 && req.payload)
-        memcpy(ezsp_buf + 5, req.payload, req.payload_len);
-    size_t ezsp_len = 5 + req.payload_len;
+        memcpy(ezsp_buf + EZSP_HEADER_LEN, req.payload, req.payload_len);
+    size_t ezsp_len = EZSP_HEADER_LEN + req.payload_len;
 
     // Take mutex for exclusive UART access
     if (xSemaphoreTake(s_sreq_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
