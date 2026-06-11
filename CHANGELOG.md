@@ -104,6 +104,37 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   yet available. `zigbee_mgr_init` no longer owns pool bootstrap. Boot
   is flat instead of ~4 s for a 200-device fleet. (F-06)
 
+### Fixed — High (P1 findings review, zigbee_pool callers)
+
+- **zigbee_backend**: every pool access now follows the locked contract
+  (`pool_find_*` pointers are only valid under `zigbee_pool_lock()`;
+  swap-with-last `pool_remove` retargets slots). `zb_write_attr`
+  snapshots the device under the lock and runs the blocking radio sends
+  on the copy; `zb_get_device` performs the `*out = *dev` copy under the
+  lock; `zb_remove_device` copies `nwk_addr` out before the blocking
+  leave request; `zb_rename_device` mutates via the new
+  `zigbee_pool_with_device` visitor and NVS-marks a detached snapshot
+  outside the mutex (`zigbee_backend.cpp:47,103,110,119` pre-fix —
+  the `:93-95` comment documented the hazard). (F6/F35)
+- **hap_dispatch**: unlocked pool access fixed across the dispatcher —
+  `emit_attr_update` copies lqi/last_seen under the lock (`:153`
+  pre-fix); `handle_get_devices` holds the lock across the
+  `pool_all()` iteration inside the CPU-only JSON encode, matching the
+  `handle_configure_req` house pattern (`:314` pre-fix);
+  `handle_get_device_by_id` (`:387`) and `handle_set_attribute`'s
+  cluster path (`:426`) snapshot under the lock and encode/send from
+  the copy; `handle_device_set_name` renames via the
+  `zigbee_pool_with_device` visitor; `handle_bind_req` and
+  `handle_device_delete` copy `nwk_addr` (+ soft-remove mark/snapshot)
+  under one lock before the blocking ZDO/leave calls. (F6/F35)
+- **lua_engine**: `zhac.set_attr` snapshots the device under the pool
+  lock before the blocking adapter sends (`zhac_lua_module.cpp:139`
+  pre-fix). (F6/F35)
+
+Note: the `ezsp_backend` pool call-sites are intentionally untouched —
+the component is compile-gated off (`CONFIG_ZHAC_NCP_ZNP=y`) and its
+rework is tracked in `extra/docs/EZSP_ASH_REWORK_PLAN.md`.
+
 ### Compatibility note
 
 - **hap_dispatch**: no protocol or behaviour change on the P4 side

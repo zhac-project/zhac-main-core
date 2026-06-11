@@ -136,29 +136,36 @@ static int l_zhac_set_attr(lua_State* L) {
         lua_pushboolean(L, 0);
         return 1;
     }
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35 (FINDINGS.md): snapshot under the pool lock; the blocking
+    // radio sends below run on the detached copy — never on a raw pool
+    // pointer that a swap-with-last remove could retarget.
+    ZapDevice snap;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGW(TAG, "set_attr: device 0x%016" PRIx64 " not in pool", ieee);
         lua_pushboolean(L, 0);
         return 1;
     }
-    const uint8_t ep = dev->endpoints[0] ? dev->endpoints[0] : 1;
+    const uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
 
     bool ok = false;
     if (lua_isboolean(L, 3)) {
-        ok = zhac_adapter_send_bool(dev->ieee_addr, dev->model_id,
-                                      dev->manufacturer_name,
-                                      dev->nwk_addr, ep, key,
+        ok = zhac_adapter_send_bool(snap.ieee_addr, snap.model_id,
+                                      snap.manufacturer_name,
+                                      snap.nwk_addr, ep, key,
                                       lua_toboolean(L, 3) != 0);
     } else if (lua_isinteger(L, 3)) {
-        ok = zhac_adapter_send_uint(dev->ieee_addr, dev->model_id,
-                                      dev->manufacturer_name,
-                                      dev->nwk_addr, ep, key,
+        ok = zhac_adapter_send_uint(snap.ieee_addr, snap.model_id,
+                                      snap.manufacturer_name,
+                                      snap.nwk_addr, ep, key,
                                       (uint64_t)lua_tointeger(L, 3));
     } else if (lua_isstring(L, 3)) {
-        ok = zhac_adapter_send_string(dev->ieee_addr, dev->model_id,
-                                        dev->manufacturer_name,
-                                        dev->nwk_addr, ep, key,
+        ok = zhac_adapter_send_string(snap.ieee_addr, snap.model_id,
+                                        snap.manufacturer_name,
+                                        snap.nwk_addr, ep, key,
                                         lua_tostring(L, 3));
     } else {
         return luaL_error(L,

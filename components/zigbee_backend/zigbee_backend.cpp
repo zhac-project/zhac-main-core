@@ -44,8 +44,16 @@ static bool zb_interview(uint64_t ieee, uint16_t /*addr_hint*/) {
 }
 
 static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t val) {
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) {
+    // F6/F35 (FINDINGS.md): snapshot under the pool lock, then run the
+    // blocking radio sends below on the detached copy — pool_find_*'s raw
+    // pointer is only valid while zigbee_pool_lock() is held (a concurrent
+    // swap-with-last pool_remove can retarget the slot).
+    ZapDevice snap;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { snap = *dev; found = true; }
+    zigbee_pool_unlock();
+    if (!found) {
         ESP_LOGW(TAG, "write_attr: device 0x%016llx not in pool", (unsigned long long)ieee);
         return false;
     }
@@ -53,14 +61,14 @@ static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t va
     // Resolve endpoint: caller-supplied takes precedence; fall back to the
     // device's first registered endpoint when caller passes 0.
     if (ep == 0) {
-        ep = (dev->endpoint_count > 0) ? dev->endpoints[0] : 1;
+        ep = (snap.endpoint_count > 0) ? snap.endpoints[0] : 1;
     }
 
     // ZHC-first: TzConverter resolution via zhac_adapter.
-    if (zhac_adapter_send_uint(dev->ieee_addr,
-                                dev->model_id,
-                                dev->manufacturer_name,
-                                dev->nwk_addr, ep, key,
+    if (zhac_adapter_send_uint(snap.ieee_addr,
+                                snap.model_id,
+                                snap.manufacturer_name,
+                                snap.nwk_addr, ep, key,
                                 static_cast<uint64_t>(val))) {
         return true;
     }
@@ -68,13 +76,13 @@ static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t va
     // Fallback: direct key→cluster mapping for common attributes
     if (strcmp(key, "state") == 0) {
         uint8_t cmd = (val != 0) ? 0x01 : 0x00;
-        return zigbee_zcl_on_off(dev->nwk_addr, ep, cmd);
+        return zigbee_zcl_on_off(snap.nwk_addr, ep, cmd);
     }
     if (strcmp(key, "brightness") == 0) {
-        return zigbee_zcl_level(dev->nwk_addr, ep, (uint8_t)(val & 0xFF), 0);
+        return zigbee_zcl_level(snap.nwk_addr, ep, (uint8_t)(val & 0xFF), 0);
     }
     if (strcmp(key, "color_temp") == 0) {
-        return zigbee_zcl_color_temp(dev->nwk_addr, ep, (uint16_t)(val & 0xFFFF), 0);
+        return zigbee_zcl_color_temp(snap.nwk_addr, ep, (uint16_t)(val & 0xFFFF), 0);
     }
 
     ESP_LOGW(TAG, "write_attr: no handler for key='%s' on 0x%016llx", key,
@@ -100,27 +108,45 @@ static bool zb_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out
 }
 
 static bool zb_get_device(uint64_t ieee, ZapDevice* out) {
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) return false;
-    *out = *dev;
-    return true;
+    // F6/F35: copy under the lock — the *out = *dev copy itself races a
+    // swap-with-last remove when done on an unlocked pointer.
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { *out = *dev; found = true; }
+    zigbee_pool_unlock();
+    return found;
 }
 
 static bool zb_remove_device(uint64_t ieee) {
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) return false;
-    zigbee_leave_req(dev->nwk_addr, ieee);
+    // F6/F35: copy nwk out under the lock; the blocking leave request must
+    // not consume an unlocked pool pointer.
+    uint16_t nwk = 0xFFFE;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { nwk = dev->nwk_addr; found = true; }
+    zigbee_pool_unlock();
+    if (!found) return false;
+    zigbee_leave_req(nwk, ieee);
     zigbee_pool_remove(ieee);
     zap_store_delete_device(ieee);
     return true;
 }
 
 static bool zb_rename_device(uint64_t ieee, const char* name) {
-    ZapDevice* dev = pool_find_by_ieee(ieee);
-    if (!dev) return false;
-    strncpy(dev->friendly_name, name, sizeof(dev->friendly_name) - 1);
-    dev->friendly_name[sizeof(dev->friendly_name) - 1] = '\0';
-    zap_store_mark_dirty(dev, ZAP_PERSIST_HIGH);
+    // F6/F35: in-place write via the locked visitor; the NVS dirty-mark
+    // then uses the detached snapshot OUTSIDE the lock (mark_dirty's
+    // dirty-table-full fallback writes flash synchronously).
+    struct RenameCtx { const char* name; ZapDevice snap; } ctx{ name, {} };
+    if (!zigbee_pool_with_device(ieee,
+            [](ZapDevice* d, void* p) {
+                auto* c = static_cast<RenameCtx*>(p);
+                strncpy(d->friendly_name, c->name, sizeof(d->friendly_name) - 1);
+                d->friendly_name[sizeof(d->friendly_name) - 1] = '\0';
+                c->snap = *d;
+            }, &ctx)) {
+        return false;
+    }
+    zap_store_mark_dirty(&ctx.snap, ZAP_PERSIST_HIGH);
     return true;
 }
 

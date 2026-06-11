@@ -150,10 +150,14 @@ static void emit_attr_update(const ZclAttrEvent& ze) {
     const char* str_val = (ze.val_type == VAL_STR) ? ze.str_val : nullptr;
     uint8_t  lqi       = 0;
     uint32_t last_seen = 0;
+    // F6/F35: copy the two scalars out under the pool lock — the raw
+    // pool_find pointer is invalid once the internal mutex is released.
+    zigbee_pool_lock();
     if (const ZapDevice* d = pool_find_by_ieee(ze.ieee)) {
         lqi       = d->link_quality;
         last_seen = d->last_seen;
     }
+    zigbee_pool_unlock();
     // Own scratch: emit_attr_update runs on task_hap, NOT the
     // hap_slave_task dispatcher, so it must not share s_hap_tx with the
     // dispatch handlers (FINDINGS.md Finding 4 — torn CRC-valid frames).
@@ -309,10 +313,18 @@ static void resolve_dev_labels(const ZapDevice* dev,
 static void handle_get_devices(const HapFrame& req) {
     auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
+    // F6/F35: hold the pool lock across the pool_all() iteration inside
+    // the encoder — same contract as handle_configure_req below. The
+    // encode is CPU-only (JSON into the static tx scratch; hap_json and
+    // zhc_adapter take no locks and never call back into the pool), so
+    // no blocking I/O runs under the mutex; the SPI send happens after
+    // unlock.
+    zigbee_pool_lock();
     bool ok = hap_json_encode_device_list(
         tx_buf, sizeof(tx_buf), &len,
         pool_all(), pool_count(),
         &resolve_dev_labels);
+    zigbee_pool_unlock();
 
     if (!ok) {
         ESP_LOGE(TAG, "GET_DEVICES encode failed");
@@ -384,9 +396,16 @@ static void handle_get_device_by_id(const HapFrame& req) {
         return;
     }
 
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    bool ok = dev
-        ? hap_json_encode_device_info_full(tx_buf, sizeof(tx_buf), &len, dev,
+    // F6/F35: snapshot under the pool lock; the encode callbacks below
+    // (shadow attrs, exposes JSON) run on the detached copy with no pool
+    // pointer in flight. 522 B stack copy — hap_slave stack is 8 KiB.
+    ZapDevice dev_snap;
+    bool found = false;
+    zigbee_pool_lock();
+    if (const ZapDevice* dev = pool_find_by_ieee(ieee)) { dev_snap = *dev; found = true; }
+    zigbee_pool_unlock();
+    bool ok = found
+        ? hap_json_encode_device_info_full(tx_buf, sizeof(tx_buf), &len, &dev_snap,
                                              &resolve_dev_labels,
                                              &emit_attrs_for_dev,
                                              &emit_exposes_for_dev)
@@ -423,25 +442,34 @@ static void handle_set_attribute(const HapFrame& req) {
             }
         } else {
             // Cluster-based dispatch (Zigbee ZCL path — backward compat)
-            ZapDevice* dev = pool_find_by_ieee(attr.ieee);
+            // F6/F35: snapshot under the pool lock; the blocking radio
+            // sends below run on the detached copy.
+            ZapDevice dev_snap;
+            bool dev_found = false;
+            zigbee_pool_lock();
+            if (const ZapDevice* dev = pool_find_by_ieee(attr.ieee)) {
+                dev_snap = *dev;
+                dev_found = true;
+            }
+            zigbee_pool_unlock();
             uint8_t ep = (attr.ep != 0) ? attr.ep
-                         : (dev && dev->endpoint_count > 0 ? dev->endpoints[0] : 1);
+                         : (dev_found && dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
 
             // Try the zhc library's write path first — it covers the
             // generated Tuya/Moes DP devices (663+ as of this writing)
             // which the legacy `zcl_converter_match` does not know.
             // Returns false cleanly when no TzConverter claims `key`,
             // so legacy dispatch still fires.
-            if (dev && dev->model_id[0]) {
+            if (dev_found && dev_snap.model_id[0]) {
                 bool adapter_sent = false;
                 if (strcmp(key, "state") == 0) {
                     adapter_sent = zhac_adapter_send_bool(
-                        attr.ieee, dev->model_id, dev->manufacturer_name,
-                        dev->nwk_addr, ep, key, attr.val != 0);
+                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
+                        dev_snap.nwk_addr, ep, key, attr.val != 0);
                 } else {
                     adapter_sent = zhac_adapter_send_uint(
-                        attr.ieee, dev->model_id, dev->manufacturer_name,
-                        dev->nwk_addr, ep, key,
+                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
+                        dev_snap.nwk_addr, ep, key,
                         static_cast<uint64_t>(attr.val));
                 }
                 if (adapter_sent) { ok = true; sent = true; }
@@ -451,7 +479,7 @@ static void handle_set_attribute(const HapFrame& req) {
             // tz_converters (handled above via zhac_adapter_send_uint) own
             // command encoding now. Fallback here: raw cluster dispatch
             // derived from the attribute key.
-            if (dev != nullptr) {
+            if (dev_found) {
                 uint16_t cluster = attr.cluster;
                 if (cluster == 0) {
                     if (strcmp(key, "state") == 0)            cluster = 0x0006;
@@ -462,12 +490,12 @@ static void handle_set_attribute(const HapFrame& req) {
                 }
                 if (cluster == 0x0006) {
                     uint8_t zcl_cmd = (attr.val != 0) ? 0x01 : 0x00;
-                    ok = zigbee_zcl_on_off(dev->nwk_addr, ep, zcl_cmd);
+                    ok = zigbee_zcl_on_off(dev_snap.nwk_addr, ep, zcl_cmd);
                 } else if (cluster == 0x0008) {
                     uint8_t level = (uint8_t)(attr.val & 0xFF);
-                    ok = zigbee_zcl_level(dev->nwk_addr, ep, level, 0);
+                    ok = zigbee_zcl_level(dev_snap.nwk_addr, ep, level, 0);
                 } else if (cluster == 0x0300) {
-                    ok = zigbee_zcl_color_temp(dev->nwk_addr, ep, (uint16_t)(attr.val & 0xFFFF), 0);
+                    ok = zigbee_zcl_color_temp(dev_snap.nwk_addr, ep, (uint16_t)(attr.val & 0xFFFF), 0);
                 } else {
                     ESP_LOGW(TAG, "SET_ATTR unhandled cluster=0x%04x key=%s ieee=0x%llx",
                              cluster, key, (unsigned long long)attr.ieee);
@@ -642,16 +670,24 @@ static void handle_device_set_name(const HapFrame& f) {
 
     if (hap_json_decode_device_set_name(f.payload, f.payload_len,
                                          &ieee, new_name, sizeof(new_name))) {
-        ZapDevice* dev = pool_find_by_ieee(ieee);
-        if (dev) {
-            strncpy(dev->friendly_name, new_name, sizeof(dev->friendly_name) - 1);
-            dev->friendly_name[sizeof(dev->friendly_name) - 1] = '\0';
-            zap_store_mark_dirty(dev, ZAP_PERSIST_HIGH);
+        // F6/F35: in-place rename via the locked visitor; NVS dirty-mark,
+        // rules reload and encode then run on the detached snapshot
+        // OUTSIDE the lock (mark_dirty's table-full fallback writes flash;
+        // simple_rules_reload takes the pool lock itself).
+        struct RenameCtx { const char* name; ZapDevice snap; } rc{ new_name, {} };
+        if (zigbee_pool_with_device(ieee,
+                [](ZapDevice* d, void* p) {
+                    auto* c = static_cast<RenameCtx*>(p);
+                    strncpy(d->friendly_name, c->name, sizeof(d->friendly_name) - 1);
+                    d->friendly_name[sizeof(d->friendly_name) - 1] = '\0';
+                    c->snap = *d;
+                }, &rc)) {
+            zap_store_mark_dirty(&rc.snap, ZAP_PERSIST_HIGH);
             simple_rules_reload(); // re-resolve friendly names
             // Legacy zcl_converter augmentation retired — the base encoder
             // already carries what the UI needs after a rename.
             encode_ok = hap_json_encode_device_info(tx_buf, sizeof(tx_buf),
-                                                     &tx_len, dev,
+                                                     &tx_len, &rc.snap,
                                                      &resolve_dev_labels);
         } else {
             encode_ok = hap_json_encode_device_info_err(tx_buf, sizeof(tx_buf),
@@ -899,8 +935,13 @@ static void handle_bind_req(const HapFrame& f) {
     uint16_t tx_len = 0;
     bool ok = false;
     if (hap_json_decode_bind_req(f.payload, f.payload_len, req)) {
-        ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee);
-        uint16_t src_nwk = src_dev ? src_dev->nwk_addr : 0xFFFE;
+        // F6/F35: copy nwk out under the pool lock; the ZDO round-trips
+        // below must not consume an unlocked pool pointer.
+        uint16_t src_nwk = 0xFFFE;
+        zigbee_pool_lock();
+        if (const ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee))
+            src_nwk = src_dev->nwk_addr;
+        zigbee_pool_unlock();
         if (req.unbind)
             ok = zigbee_zdo_unbind(src_nwk, req.src_ieee, req.src_ep,
                                    req.cluster, req.dst_ieee, req.dst_ep);
@@ -922,9 +963,28 @@ static void handle_device_delete(const HapFrame& f) {
     if (hap_json_decode_device_delete(f.payload, f.payload_len, &ieee, &hard)) {
         ESP_LOGI(TAG, "DEVICE_DELETE ieee=0x%016llX hard=%d",
                  (unsigned long long)ieee, (int)hard);
-        ZapDevice* dev = pool_find_by_ieee(ieee);
-        if (dev) {
-            zigbee_leave_req(dev->nwk_addr, ieee);
+        // F6/F35: one locked section does find + nwk copy + (soft path)
+        // mark + snapshot; the blocking leave request and the NVS
+        // dirty-mark then run on detached copies outside the lock.
+        bool dev_found = false;
+        uint16_t nwk_cp = 0xFFFE;
+        ZapDevice snap;
+        zigbee_pool_lock();
+        if (ZapDevice* dev = pool_find_by_ieee(ieee)) {
+            dev_found = true;
+            nwk_cp = dev->nwk_addr;
+            if (!hard) {
+                // Soft-remove: keep the slot + NVS record so a rejoin
+                // restores configure state without rediscovery. Hide
+                // from the UI until then (see hap_json device-list
+                // filter).
+                zap_dev_mark_removed(dev);
+                snap = *dev;
+            }
+        }
+        zigbee_pool_unlock();
+        if (dev_found) {
+            zigbee_leave_req(nwk_cp, ieee);
             if (hard) {
                 // "Forget forever" — drop NVS record, pool slot, and
                 // every per-ieee cache so the next rejoin runs a full
@@ -939,12 +999,7 @@ static void handle_device_delete(const HapFrame& f) {
                 ESP_LOGI(TAG, "DEVICE_DELETE hard sweep done ieee=0x%016llX "
                                "pool_removed=%d", (unsigned long long)ieee, (int)ok);
             } else {
-                // Soft-remove: keep the slot + NVS record so a rejoin
-                // restores configure state without rediscovery. Hide
-                // from the UI until then (see hap_json device-list
-                // filter).
-                zap_dev_mark_removed(dev);
-                zap_store_mark_dirty(dev, ZAP_PERSIST_LOW);
+                zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
                 ok = true;
             }
         } else if (hard) {
