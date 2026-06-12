@@ -185,6 +185,14 @@ static void hap_slave_task(void*) {
 
             if (peer.payload_len > 0) {
                 if (hap_verify_stage2(s_rx_buf, peer.payload_len)) {
+                    // peer.payload points at s_rx_buf, the LIVE DMA receive
+                    // buffer — valid ONLY for the duration of this synchronous
+                    // s_cb call. The next exchange memsets/overwrites it. A
+                    // handler MUST NOT stash peer.payload for async use; copy
+                    // the bytes out if needed. (The master path copies into a
+                    // dispatch buffer first; the slave dispatches in place
+                    // because the P4 HAP dispatcher is single-task — F-08 — and
+                    // consumes synchronously.)
                     peer.payload = s_rx_buf;
                     if (s_cb) s_cb(peer);
                 } else {

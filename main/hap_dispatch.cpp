@@ -805,7 +805,9 @@ static void handle_rule_list_req(const HapFrame& f) {
 static void handle_script_write(const HapFrame& f) {
     hap_dispatch_assert_single_task();  // F-08
     char name_raw[HAP_SCRIPT_NAME_MAX + 8] = {0};
-    static char src[HAP_SCRIPT_MAX_SRC + 1];
+    static char src[HAP_SCRIPT_MAX_SRC + 1];  // static (too big for stack) —
+        // safe to share across calls ONLY because the F-08 assert above
+        // guarantees a single dispatch task; a 2nd dispatch task would alias it.
     HapRuleExecResult result{};
     if (!hap_json_decode_script_write(f.payload, f.payload_len,
                                        name_raw, sizeof(name_raw),
@@ -1378,12 +1380,8 @@ void handle_metrics_req(const HapFrame& f) {
     const size_t n = metrics::prometheus_format(
         reinterpret_cast<char*>(tx_buf), sizeof(tx_buf), "zhac_p4");
 
-    HapFrame rsp = hap_make_reply(f, HapMsgType::METRICS_RSP,
-                                     HAP_FLAG_NO_ACK);
-    rsp.seq         = hap_session_next_seq();
-    rsp.payload     = tx_buf;
-    rsp.payload_len = static_cast<uint16_t>(n);
-    hap_session_send(rsp);
+    hap_send(HapMsgType::METRICS_RSP, tx_buf, static_cast<uint16_t>(n),
+             HAP_FLAG_NO_ACK, f.seq);
 }
 
 }  // namespace (P-F2 handler table + extracted lambdas)
