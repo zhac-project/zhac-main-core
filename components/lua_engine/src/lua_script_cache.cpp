@@ -130,6 +130,21 @@ extern "C" int lua_script_cache_read(const char* name, char* out, size_t cap) {
     if (!name_ok(name) || !out || cap == 0 || !ensure_mounted()) return -1;
     char path[96];
     if (!build_path(path, sizeof(path), name)) return -1;
+    // T20: stat the file BEFORE reading and FAIL (-1) if it can't fit in
+    // `cap` (less the NUL). Previously fread() silently capped at cap-1,
+    // so an oversize stored script was handed to the compiler truncated
+    // mid-statement — it either failed to parse or, worse, parsed a
+    // half-script and ran the wrong code. The write path enforces
+    // LUA_SCRIPT_SRC_MAX, so a correctly-stored file always fits a
+    // (LUA_SCRIPT_SRC_MAX + 1) buffer; a larger file on disk is
+    // corruption and must be rejected, not truncated.
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    if ((size_t)st.st_size > cap - 1) {
+        ESP_LOGE(TAG, "script '%s' too large for buffer: %ld > %zu — refusing truncated read",
+                 name, (long)st.st_size, cap - 1);
+        return -1;
+    }
     FILE* fp = std::fopen(path, "r");
     if (!fp) return -1;
     const size_t n = std::fread(out, 1, cap - 1, fp);
@@ -141,8 +156,9 @@ extern "C" int lua_script_cache_read(const char* name, char* out, size_t cap) {
 extern "C" bool lua_script_cache_write(const char* name, const char* src) {
     if (!name_ok(name) || !src || !ensure_mounted()) return false;
     const size_t src_len = std::strlen(src);
-    if (src_len > 16 * 1024) {
-        ESP_LOGW(TAG, "script '%s' too large: %zu bytes", name, src_len);
+    if (src_len > LUA_SCRIPT_SRC_MAX) {   // T20: unified cap (was 16*1024 literal)
+        ESP_LOGW(TAG, "script '%s' too large: %zu bytes (max %d)",
+                 name, src_len, LUA_SCRIPT_SRC_MAX);
         return false;
     }
 
@@ -166,10 +182,15 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
         return false;
     }
     const size_t w = std::fwrite(src, 1, src_len, fp);
-    std::fflush(fp);
-    std::fclose(fp);
-    if (w != src_len) {
-        ESP_LOGE(TAG, "short write '%s': %zu/%zu", tmp, w, src_len);
+    // T20: a buffered fwrite can report the full count yet still fail to
+    // commit at flush/close time when the SPIFFS partition is full. Check
+    // fflush AND fclose return codes BEFORE the rename so a failed flush
+    // can't promote a truncated/empty .tmp into place reporting success.
+    const bool flush_ok = (std::fflush(fp) == 0);
+    const bool close_ok = (std::fclose(fp) == 0);   // closes fp on success AND failure
+    if (w != src_len || !flush_ok || !close_ok) {
+        ESP_LOGE(TAG, "write '%s' failed: w=%zu/%zu flush=%d close=%d",
+                 tmp, w, src_len, (int)flush_ok, (int)close_ok);
         unlink(tmp);
         return false;
     }

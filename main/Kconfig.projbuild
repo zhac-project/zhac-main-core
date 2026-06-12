@@ -11,9 +11,16 @@ menu "ZHAC Zigbee NCP Backend"
                 CC2652/CC2530 coprocessors using TI's MT serial protocol.
 
         config ZHAC_NCP_EZSP
-            bool "Silicon Labs EmberZNet (EZSP/ASH protocol)"
+            bool "Silicon Labs EmberZNet (EZSP/ASH protocol) — EXPERIMENTAL"
+            depends on ZHAC_EZSP_BACKEND_ENABLE
             help
-                EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH framing.
+                EFR32MG coprocessors using Silicon Labs EZSP protocol over ASH
+                framing. EXPERIMENTAL, known-broken link layer: the response
+                pump is never serviced while a request waits, so requests are
+                guaranteed to time out, and there is no ASH retransmit path.
+                Hidden unless ZHAC_EZSP_BACKEND_ENABLE is set (Component
+                config → ZHAC EZSP NCP). Do not ship.
+                See extra/docs/EZSP_ASH_REWORK_PLAN.md (workspace-local).
 
         config ZHAC_NCP_C6
             bool "Espressif ESP32-C6 (ZNCP / esp-zigbee-sdk)"
@@ -66,6 +73,23 @@ menu "ZHAC Zigbee NCP Backend"
                 example. Drop to 115200 if signal integrity on the wire
                 between the two boards is borderline.
     endmenu
+endmenu
+
+menu "ZHAC Zigbee Commissioning"
+    config ZHAC_PERMIT_JOIN_ON_BOOT
+        bool "Auto-open permit-join on boot and after ZNP recovery"
+        default n
+        help
+            When enabled, the coordinator automatically opens the Zigbee
+            network for joining for ~250 s every time it boots, and again
+            after a ZNP crash-recovery. This is convenient for a first
+            setup but is a standing security exposure: any device can
+            join unattended during that window on every power cycle.
+
+            Default OFF (T20). Pairing remains fully available on demand
+            via the SPA "permit join" control / the PERMIT_JOIN HAP
+            message / the physical join button — only the automatic open
+            at boot/recovery is gated by this option.
 endmenu
 
 menu "ZHAC HAP Diagnostics"

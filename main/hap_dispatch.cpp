@@ -37,6 +37,7 @@
 #include "mqtt_gw.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "nvs_checked.h"
 #include "esp_random.h"
 #include "p4_ota.h"
 #include "device_backend.h"
@@ -150,10 +151,14 @@ static void emit_attr_update(const ZclAttrEvent& ze) {
     const char* str_val = (ze.val_type == VAL_STR) ? ze.str_val : nullptr;
     uint8_t  lqi       = 0;
     uint32_t last_seen = 0;
+    // F6/F35: copy the two scalars out under the pool lock — the raw
+    // pool_find pointer is invalid once the internal mutex is released.
+    zigbee_pool_lock();
     if (const ZapDevice* d = pool_find_by_ieee(ze.ieee)) {
         lqi       = d->link_quality;
         last_seen = d->last_seen;
     }
+    zigbee_pool_unlock();
     // Own scratch: emit_attr_update runs on task_hap, NOT the
     // hap_slave_task dispatcher, so it must not share s_hap_tx with the
     // dispatch handlers (FINDINGS.md Finding 4 — torn CRC-valid frames).
@@ -309,10 +314,18 @@ static void resolve_dev_labels(const ZapDevice* dev,
 static void handle_get_devices(const HapFrame& req) {
     auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
+    // F6/F35: hold the pool lock across the pool_all() iteration inside
+    // the encoder — same contract as handle_configure_req below. The
+    // encode is CPU-only (JSON into the static tx scratch; hap_json and
+    // zhc_adapter take no locks and never call back into the pool), so
+    // no blocking I/O runs under the mutex; the SPI send happens after
+    // unlock.
+    zigbee_pool_lock();
     bool ok = hap_json_encode_device_list(
         tx_buf, sizeof(tx_buf), &len,
         pool_all(), pool_count(),
         &resolve_dev_labels);
+    zigbee_pool_unlock();
 
     if (!ok) {
         ESP_LOGE(TAG, "GET_DEVICES encode failed");
@@ -384,9 +397,13 @@ static void handle_get_device_by_id(const HapFrame& req) {
         return;
     }
 
-    const ZapDevice* dev = pool_find_by_ieee(ieee);
-    bool ok = dev
-        ? hap_json_encode_device_info_full(tx_buf, sizeof(tx_buf), &len, dev,
+    // F6/F35: snapshot under the pool lock; the encode callbacks below
+    // (shadow attrs, exposes JSON) run on the detached copy with no pool
+    // pointer in flight. 522 B stack copy — hap_slave stack is 8 KiB.
+    ZapDevice dev_snap;
+    const bool found = zigbee_pool_snapshot(ieee, &dev_snap);
+    bool ok = found
+        ? hap_json_encode_device_info_full(tx_buf, sizeof(tx_buf), &len, &dev_snap,
                                              &resolve_dev_labels,
                                              &emit_attrs_for_dev,
                                              &emit_exposes_for_dev)
@@ -423,25 +440,28 @@ static void handle_set_attribute(const HapFrame& req) {
             }
         } else {
             // Cluster-based dispatch (Zigbee ZCL path — backward compat)
-            ZapDevice* dev = pool_find_by_ieee(attr.ieee);
+            // F6/F35: snapshot under the pool lock; the blocking radio
+            // sends below run on the detached copy.
+            ZapDevice dev_snap;
+            const bool dev_found = zigbee_pool_snapshot(attr.ieee, &dev_snap);
             uint8_t ep = (attr.ep != 0) ? attr.ep
-                         : (dev && dev->endpoint_count > 0 ? dev->endpoints[0] : 1);
+                         : (dev_found && dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
 
             // Try the zhc library's write path first — it covers the
             // generated Tuya/Moes DP devices (663+ as of this writing)
             // which the legacy `zcl_converter_match` does not know.
             // Returns false cleanly when no TzConverter claims `key`,
             // so legacy dispatch still fires.
-            if (dev && dev->model_id[0]) {
+            if (dev_found && dev_snap.model_id[0]) {
                 bool adapter_sent = false;
                 if (strcmp(key, "state") == 0) {
                     adapter_sent = zhac_adapter_send_bool(
-                        attr.ieee, dev->model_id, dev->manufacturer_name,
-                        dev->nwk_addr, ep, key, attr.val != 0);
+                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
+                        dev_snap.nwk_addr, ep, key, attr.val != 0);
                 } else {
                     adapter_sent = zhac_adapter_send_uint(
-                        attr.ieee, dev->model_id, dev->manufacturer_name,
-                        dev->nwk_addr, ep, key,
+                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
+                        dev_snap.nwk_addr, ep, key,
                         static_cast<uint64_t>(attr.val));
                 }
                 if (adapter_sent) { ok = true; sent = true; }
@@ -451,7 +471,7 @@ static void handle_set_attribute(const HapFrame& req) {
             // tz_converters (handled above via zhac_adapter_send_uint) own
             // command encoding now. Fallback here: raw cluster dispatch
             // derived from the attribute key.
-            if (dev != nullptr) {
+            if (dev_found) {
                 uint16_t cluster = attr.cluster;
                 if (cluster == 0) {
                     if (strcmp(key, "state") == 0)            cluster = 0x0006;
@@ -462,12 +482,12 @@ static void handle_set_attribute(const HapFrame& req) {
                 }
                 if (cluster == 0x0006) {
                     uint8_t zcl_cmd = (attr.val != 0) ? 0x01 : 0x00;
-                    ok = zigbee_zcl_on_off(dev->nwk_addr, ep, zcl_cmd);
+                    ok = zigbee_zcl_on_off(dev_snap.nwk_addr, ep, zcl_cmd);
                 } else if (cluster == 0x0008) {
                     uint8_t level = (uint8_t)(attr.val & 0xFF);
-                    ok = zigbee_zcl_level(dev->nwk_addr, ep, level, 0);
+                    ok = zigbee_zcl_level(dev_snap.nwk_addr, ep, level, 0);
                 } else if (cluster == 0x0300) {
-                    ok = zigbee_zcl_color_temp(dev->nwk_addr, ep, (uint16_t)(attr.val & 0xFFFF), 0);
+                    ok = zigbee_zcl_color_temp(dev_snap.nwk_addr, ep, (uint16_t)(attr.val & 0xFFFF), 0);
                 } else {
                     ESP_LOGW(TAG, "SET_ATTR unhandled cluster=0x%04x key=%s ieee=0x%llx",
                              cluster, key, (unsigned long long)attr.ieee);
@@ -492,10 +512,16 @@ static void handle_set_attribute(const HapFrame& req) {
                                          static_cast<int32_t>(attr.val));
     }
 
-    if (!sent) {
-        if (hap_json_encode_set_ack(tx_buf, sizeof(tx_buf), &len, attr.ieee, ok)) {
-            hap_send(HapMsgType::SET_ACK, tx_buf, len, HAP_FLAG_NEEDS_ACK, req.seq);
-        }
+    // T20 (pairs with T14): ALWAYS send SET_ACK, including on the adapter
+    // (zhc tz_converter) path. The `sent` flag used to suppress the ACK
+    // when the adapter path handled the write, but the adapter path emits
+    // a Zigbee command — NOT a HAP reply — so suppressing it left S3's
+    // seq-correlated waiter to time out on every adapter-routed SET. The
+    // ack carries `ok` so S3 still learns success/failure; there is no
+    // separate adapter-path reply to double up with.
+    (void)sent;
+    if (hap_json_encode_set_ack(tx_buf, sizeof(tx_buf), &len, attr.ieee, ok)) {
+        hap_send(HapMsgType::SET_ACK, tx_buf, len, HAP_FLAG_NEEDS_ACK, req.seq);
     }
 }
 
@@ -504,6 +530,13 @@ static void handle_sync(const HapFrame& f) {
     HapSyncInfo info{};
     if (!hap_json_decode_sync(f.payload, f.payload_len, info)) return;
     if (info.is_ack) return;  // P4 doesn't initiate SYNC — ignore ACK
+
+    // A real inbound SYNC_REQ is S3 (re-)establishing the link — possibly after
+    // it gave up on a half-dead link (roundtrip-timeout streak). Drop any stale
+    // in-flight retransmit frames so the recovered link starts with an empty
+    // window, even if on_link_dead never fired (e.g. a unidirectional outage
+    // with no P4 NEEDS_ACK frames in flight at the time). Idempotent + cheap.
+    hap_session_reset_link();
 
     auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
@@ -635,16 +668,24 @@ static void handle_device_set_name(const HapFrame& f) {
 
     if (hap_json_decode_device_set_name(f.payload, f.payload_len,
                                          &ieee, new_name, sizeof(new_name))) {
-        ZapDevice* dev = pool_find_by_ieee(ieee);
-        if (dev) {
-            strncpy(dev->friendly_name, new_name, sizeof(dev->friendly_name) - 1);
-            dev->friendly_name[sizeof(dev->friendly_name) - 1] = '\0';
-            zap_store_mark_dirty(dev, ZAP_PERSIST_HIGH);
+        // F6/F35: in-place rename via the locked visitor; NVS dirty-mark,
+        // rules reload and encode then run on the detached snapshot
+        // OUTSIDE the lock (mark_dirty's table-full fallback writes flash;
+        // simple_rules_reload takes the pool lock itself).
+        struct RenameCtx { const char* name; ZapDevice snap; } rc{ new_name, {} };
+        if (zigbee_pool_with_device(ieee,
+                [](ZapDevice* d, void* p) {
+                    auto* c = static_cast<RenameCtx*>(p);
+                    strncpy(d->friendly_name, c->name, sizeof(d->friendly_name) - 1);
+                    d->friendly_name[sizeof(d->friendly_name) - 1] = '\0';
+                    c->snap = *d;
+                }, &rc)) {
+            zap_store_mark_dirty(&rc.snap, ZAP_PERSIST_HIGH);
             simple_rules_reload(); // re-resolve friendly names
             // Legacy zcl_converter augmentation retired — the base encoder
             // already carries what the UI needs after a rename.
             encode_ok = hap_json_encode_device_info(tx_buf, sizeof(tx_buf),
-                                                     &tx_len, dev,
+                                                     &tx_len, &rc.snap,
                                                      &resolve_dev_labels);
         } else {
             encode_ok = hap_json_encode_device_info_err(tx_buf, sizeof(tx_buf),
@@ -661,8 +702,20 @@ static void handle_device_set_name(const HapFrame& f) {
 }
 
 static void handle_time_sync(const HapFrame& f) {
+    // T20: reject implausible timestamps. A ts before 2020-01-01 UTC
+    // (1577836800) is almost certainly 0 / garbage from an S3 that hasn't
+    // itself acquired time yet; accepting it would set the P4 clock to
+    // ~1970 and break every cron rule (next-fire computed from a bogus
+    // wall clock) until the next good sync. Hold the previous time
+    // instead — cron keeps using whatever monotonic baseline it had.
+    static constexpr uint32_t kMinValidTs = 1577836800u;  // 2020-01-01T00:00:00Z
     uint32_t ts = 0;
     if (hap_json_decode_time_sync(f.payload, f.payload_len, &ts)) {
+        if (ts < kMinValidTs) {
+            ESP_LOGW(TAG, "TIME_SYNC rejected implausible ts=%lu (< 2020-01-01)",
+                     (unsigned long)ts);
+            return;
+        }
         struct timeval tv{ .tv_sec = (time_t)ts, .tv_usec = 0 };
         settimeofday(&tv, nullptr);
         ESP_LOGI(TAG, "System time set: ts=%lu", (unsigned long)ts);
@@ -880,10 +933,20 @@ static void handle_script_read_req(const HapFrame& f) {
 
 static void handle_permit_join(const HapFrame& f) {
     uint8_t dur = 0;
-    if (hap_json_decode_permit_join(f.payload, f.payload_len, &dur))
+    if (hap_json_decode_permit_join(f.payload, f.payload_len, &dur)) {
+        // T20: clamp to ≤254. Per ZDO Mgmt_Permit_Joining, duration 0xFF
+        // (255) means "permanently open" — a foot-gun if the SPA ever
+        // sends 255 (intending "max"), leaving the network open to
+        // joining forever with no auto-close. 254 s is the longest
+        // bounded window; 0 still closes.
+        if (dur == 255) {
+            ESP_LOGW(TAG, "PERMIT_JOIN 255 (permanent) clamped to 254 s");
+            dur = 254;
+        }
         zigbee_permit_join(dur);
-    else
+    } else {
         ESP_LOGW(TAG, "PERMIT_JOIN decode failed");
+    }
 }
 
 static void handle_bind_req(const HapFrame& f) {
@@ -892,8 +955,13 @@ static void handle_bind_req(const HapFrame& f) {
     uint16_t tx_len = 0;
     bool ok = false;
     if (hap_json_decode_bind_req(f.payload, f.payload_len, req)) {
-        ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee);
-        uint16_t src_nwk = src_dev ? src_dev->nwk_addr : 0xFFFE;
+        // F6/F35: copy nwk out under the pool lock; the ZDO round-trips
+        // below must not consume an unlocked pool pointer.
+        uint16_t src_nwk = 0xFFFE;
+        zigbee_pool_lock();
+        if (const ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee))
+            src_nwk = src_dev->nwk_addr;
+        zigbee_pool_unlock();
         if (req.unbind)
             ok = zigbee_zdo_unbind(src_nwk, req.src_ieee, req.src_ep,
                                    req.cluster, req.dst_ieee, req.dst_ep);
@@ -915,9 +983,28 @@ static void handle_device_delete(const HapFrame& f) {
     if (hap_json_decode_device_delete(f.payload, f.payload_len, &ieee, &hard)) {
         ESP_LOGI(TAG, "DEVICE_DELETE ieee=0x%016llX hard=%d",
                  (unsigned long long)ieee, (int)hard);
-        ZapDevice* dev = pool_find_by_ieee(ieee);
-        if (dev) {
-            zigbee_leave_req(dev->nwk_addr, ieee);
+        // F6/F35: one locked section does find + nwk copy + (soft path)
+        // mark + snapshot; the blocking leave request and the NVS
+        // dirty-mark then run on detached copies outside the lock.
+        bool dev_found = false;
+        uint16_t nwk_cp = 0xFFFE;
+        ZapDevice snap;
+        zigbee_pool_lock();
+        if (ZapDevice* dev = pool_find_by_ieee(ieee)) {
+            dev_found = true;
+            nwk_cp = dev->nwk_addr;
+            if (!hard) {
+                // Soft-remove: keep the slot + NVS record so a rejoin
+                // restores configure state without rediscovery. Hide
+                // from the UI until then (see hap_json device-list
+                // filter).
+                zap_dev_mark_removed(dev);
+                snap = *dev;
+            }
+        }
+        zigbee_pool_unlock();
+        if (dev_found) {
+            zigbee_leave_req(nwk_cp, ieee);
             if (hard) {
                 // "Forget forever" — drop NVS record, pool slot, and
                 // every per-ieee cache so the next rejoin runs a full
@@ -932,12 +1019,7 @@ static void handle_device_delete(const HapFrame& f) {
                 ESP_LOGI(TAG, "DEVICE_DELETE hard sweep done ieee=0x%016llX "
                                "pool_removed=%d", (unsigned long long)ieee, (int)ok);
             } else {
-                // Soft-remove: keep the slot + NVS record so a rejoin
-                // restores configure state without rediscovery. Hide
-                // from the UI until then (see hap_json device-list
-                // filter).
-                zap_dev_mark_removed(dev);
-                zap_store_mark_dirty(dev, ZAP_PERSIST_LOW);
+                zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
                 ok = true;
             }
         } else if (hard) {
@@ -971,16 +1053,53 @@ static void handle_interview_req(const HapFrame& f) {
 // from the pool. Payload shape is identical to INTERVIEW_REQ so the
 // same JSON decoder works for both.
 //
-// Releases the pool lock before invoking `zhac_adapter_configure` —
-// the call issues radio frames that can block on AF_DATA_CONFIRM for
-// ~2.5 s; holding the pool mutex would stall every other device
-// dispatching attrs simultaneously.
+// ── CONFIGURE offload worker (T20) ────────────────────────────────────
+// `zhac_adapter_configure` issues a pipeline of radio frames, each of
+// which can block on AF_DATA_CONFIRM for up to ~2.5 s. Run synchronously
+// in the CONFIGURE_REQ handler that meant the HAP dispatcher
+// (hap_slave_task) sat blocked for seconds per device — long enough that
+// heartbeats stall and the link can be declared dead. The dispatcher
+// must never block >50 ms.
+//
+// CONFIGURE_REQ is a fire-and-forget message (hap_protocol.h: no
+// CONFIGURE_ACK/NAK type exists, and S3 awaits no reply — the configure
+// result reaches S3 through the normal attr-report path as the device
+// responds). So the fix is purely to MOVE the blocking call off the
+// dispatch task: the handler decodes + snapshots under the pool lock,
+// enqueues the work, and returns immediately. A dedicated low-priority
+// cfg_worker task drains the queue and runs the blocking configure. On
+// queue-full we log and drop (configure is rare and user-retriable);
+// there is no NAK frame to send.
+struct CfgWorkItem {
+    uint64_t ieee;
+    uint16_t nwk;
+    char     model[64];   // > ZapDevice::model_id (~34 B); -Wformat-truncation headroom
+    char     manu[64];
+};
+static QueueHandle_t s_cfg_worker_q = nullptr;
+
+static void cfg_worker_task(void*) {
+    ESP_LOGI(TAG, "cfg_worker started");
+    CfgWorkItem it;
+    for (;;) {
+        if (xQueueReceive(s_cfg_worker_q, &it, portMAX_DELAY) != pdTRUE) continue;
+        const bool ok = zhac_adapter_configure(it.ieee, it.nwk, it.model, it.manu);
+        ESP_LOGI(TAG, "CONFIGURE ieee=0x%016llx model=%s -> %s",
+                 (unsigned long long)it.ieee, it.model, ok ? "ok" : "fail");
+        // No HAP reply: CONFIGURE_REQ is fire-and-forget. The resulting
+        // attr reports flow to S3 via on_zcl_attr_for_hap as the device
+        // answers the reconfigured reports/reads.
+    }
+}
+
 static void handle_configure_req(const HapFrame& f) {
     uint64_t ieee = 0;
     if (!hap_json_decode_interview_req(f.payload, f.payload_len, &ieee)) {
         ESP_LOGW(TAG, "CONFIGURE_REQ decode failed");
         return;
     }
+    CfgWorkItem it{};
+    // Snapshot identity under the pool lock — fast, no radio I/O here.
     zigbee_pool_lock();
     const ZapDevice* dev = pool_find_by_ieee(ieee);
     if (!dev || dev->model_id[0] == '\0') {
@@ -989,19 +1108,21 @@ static void handle_configure_req(const HapFrame& f) {
                  (unsigned long long)ieee);
         return;
     }
-    const uint64_t ieee_cp = dev->ieee_addr;
-    const uint16_t nwk_cp  = dev->nwk_addr;
-    // Buffers sized to comfortably exceed ZapDevice::model_id /
-    // manufacturer_name (~34 B each) — anything smaller trips
-    // -Werror=format-truncation.
-    char model_cp[64], manu_cp[64];
-    snprintf(model_cp, sizeof(model_cp), "%s", dev->model_id);
-    snprintf(manu_cp,  sizeof(manu_cp),  "%s", dev->manufacturer_name);
+    it.ieee = dev->ieee_addr;
+    it.nwk  = dev->nwk_addr;
+    snprintf(it.model, sizeof(it.model), "%s", dev->model_id);
+    snprintf(it.manu,  sizeof(it.manu),  "%s", dev->manufacturer_name);
     zigbee_pool_unlock();
 
-    const bool ok = zhac_adapter_configure(ieee_cp, nwk_cp, model_cp, manu_cp);
-    ESP_LOGI(TAG, "CONFIGURE_REQ ieee=0x%016llx model=%s -> %s",
-             (unsigned long long)ieee_cp, model_cp, ok ? "ok" : "fail");
+    // Hand off to the worker; the blocking ~2.5 s/step run happens there,
+    // NOT on the dispatch task. Return immediately so the dispatcher stays
+    // responsive (<50 ms). Drop on queue-full — configure is rare and the
+    // SPA button is user-retriable; no NAK frame exists to signal busy.
+    if (!s_cfg_worker_q ||
+        xQueueSend(s_cfg_worker_q, &it, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "CONFIGURE_REQ ieee=0x%016llx dropped — worker busy",
+                 (unsigned long long)it.ieee);
+    }
 }
 
 static void handle_device_options_set(const HapFrame& f) {
@@ -1062,25 +1183,43 @@ static void handle_zigbee_cfg_set(const HapFrame& f) {
                                         &new_chan,
                                         new_key, sizeof(new_key),
                                         &key_present, &regenerate)) {
+        // P1-T8: an out-of-range channel used to be silently dropped while
+        // the request was still acked ok — NAK the whole request instead
+        // (no partial write) so the S3/UI sees the rejection.
+        const bool chan_in_range = (new_chan < 0) ||  // -1 = not provided
+                                   (new_chan >= 11 && new_chan <= 26);
         nvs_handle_t h;
-        if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        if (!chan_in_range) {
+            ESP_LOGW(TAG, "ZIGBEE_CFG_SET: channel %d out of range (11-26) — NAK",
+                     new_chan);
+        } else if (nvs_open("zigbee_cfg", NVS_READWRITE, &h) == ESP_OK) {
+            esp_err_t acc = ESP_OK;
             if (new_chan >= 11 && new_chan <= 26) {
-                nvs_set_u8(h, "channel", (uint8_t)new_chan);
+                nvs_seq(&acc, nvs_set_u8(h, "channel", (uint8_t)new_chan),
+                        TAG, "set_u8 channel");
             }
             if (regenerate) {
                 esp_fill_random(new_key, sizeof(new_key));
                 key_present = true;
-                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: regenerated random network key");
+                // Intent, not outcome — this fires before set_blob/commit;
+                // the post-commit "net_key=updated" line below is the
+                // persisted-success confirmation.
+                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: generating random network key");
             }
             if (key_present) {
-                nvs_set_blob(h, "net_key", new_key, sizeof(new_key));
+                nvs_seq(&acc, nvs_set_blob(h, "net_key", new_key, sizeof(new_key)),
+                        TAG, "set_blob net_key");
             }
-            nvs_commit(h);
+            nvs_seq(&acc, nvs_commit(h), TAG, "commit zigbee_cfg");
             nvs_close(h);
-            ok = true;
-            ESP_LOGI(TAG, "ZIGBEE_CFG_SET: channel=%d net_key=%s "
-                          "(applies on next factory reset)",
-                     new_chan, key_present ? "updated" : "unchanged");
+            // P1-T8: NVS failures now propagate into the ack instead of
+            // unconditionally reporting ok.
+            ok = (acc == ESP_OK);
+            if (ok) {
+                ESP_LOGI(TAG, "ZIGBEE_CFG_SET: channel=%d net_key=%s "
+                              "(applies on next factory reset)",
+                         new_chan, key_present ? "updated" : "unchanged");
+            }
         } else {
             ESP_LOGW(TAG, "ZIGBEE_CFG_SET: nvs_open failed");
         }
@@ -1246,6 +1385,17 @@ void task_hap(void*) {
     s_hap_tx_q = xQueueCreate(HAP_TX_QUEUE_DEPTH, sizeof(HapTxItem));
     configASSERT(s_hap_tx_q);
 
+    // T20: CONFIGURE offload. Shallow queue (configure is rare; depth 4
+    // is plenty of slack) + a dedicated worker so the ~2.5 s/step radio
+    // pipeline never runs on this dispatch task. Created before the
+    // session is wired so a CONFIGURE_REQ arriving immediately has a
+    // queue to land in. kZbConfigure is the established configure-pipeline
+    // stack size.
+    s_cfg_worker_q = xQueueCreate(4, sizeof(CfgWorkItem));
+    configASSERT(s_cfg_worker_q);
+    xTaskCreate(cfg_worker_task, "cfg_worker",
+                zhac::stack::kZbConfigure, nullptr, 4, nullptr);
+
     // P-F2: register handlers from the table.
     for (const auto& row : kHapHandlers) {
         s_hap_handlers[static_cast<uint8_t>(row.type)] = row.fn;
@@ -1261,7 +1411,17 @@ void task_hap(void*) {
                 ESP_LOGW(TAG, "unhandled HAP type=0x%02x", idx);
         },
         .on_sync      = handle_sync,
-        .on_link_dead = []() { ESP_LOGE(TAG, "HAP link dead — awaiting SYNC"); },
+        .on_link_dead = []() {
+            // Data S3→P4 requests are NO_ACK, so S3's window-based detector never
+            // fires for them; recovery is now driven by S3's roundtrip-timeout
+            // streak forcing a re-SYNC (see net-core hap_bridge.cpp). Free our
+            // in-flight retransmit window now so siblings of the dead frame can't
+            // keep retransmitting stale pre-outage seqs and wedge the window full
+            // before/after that re-SYNC. Cheap + non-blocking; heartbeats keep
+            // running (S3 still needs them as a coarse liveness signal).
+            ESP_LOGE(TAG, "HAP link dead — clearing in-flight window, awaiting S3 re-SYNC");
+            hap_session_reset_link();
+        },
     });
 
     hap_slave_set_callback([](const HapFrame& f) {
@@ -1277,7 +1437,18 @@ void task_hap(void*) {
 
     TickType_t last_hb   = xTaskGetTickCount();
 
+    // T20: real task-watchdog coverage for the HAP TX/tick loop. This
+    // loop cycles every ≤10 ms (the qrecv timeout paces it), so a wedge
+    // here trips the 10 s WDT instead of being masked by the old
+    // always-healthy feeder task. The frame DISPATCHER itself runs in
+    // hap_slave_task (component-owned); the two former multi-second
+    // dispatch blockers — CONFIGURE and the OTA upfront erase — are now
+    // offloaded / sequential (see handle_configure_req + p4_ota.cpp) so
+    // the dispatcher no longer stalls for seconds.
+    esp_task_wdt_add(nullptr);
+
     while (true) {
+        esp_task_wdt_reset();
         // Tick session every 10 ms for retransmit checks
         hap_session_tick();
 

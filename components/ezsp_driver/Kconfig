@@ -1,6 +1,23 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 menu "ZHAC EZSP NCP"
+    config ZHAC_EZSP_BACKEND_ENABLE
+        bool "EZSP/ASH backend (EXPERIMENTAL, known-broken link layer)"
+        default n
+        help
+            Compiles the experimental Silicon Labs EZSP/ASH NCP backend
+            (components ezsp_driver + ezsp_backend) into the firmware and
+            unlocks the "Silicon Labs EmberZNet" option in the NCP Protocol
+            choice. The ASH link layer is structurally incomplete: no
+            retransmit path, conflated ACK counters, and the response
+            semaphore is only serviced from the caller's own poll loop,
+            which never runs while that caller is blocked waiting — so
+            requests are guaranteed to time out. Do NOT ship with this
+            enabled — bench bring-up only. Rework plan:
+            extra/docs/EZSP_ASH_REWORK_PLAN.md (workspace-local).
+
+    if ZHAC_EZSP_BACKEND_ENABLE
+
     config ZHAC_EZSP_UART_TX_GPIO
         int "EZSP UART TX GPIO pin"
         default 26
@@ -21,4 +38,6 @@ menu "ZHAC EZSP NCP"
         help
             GPIO pin connected to EFR32 NCP nRESET.
             Default IO28 (shared reset line).
+
+    endif # ZHAC_EZSP_BACKEND_ENABLE
 endmenu

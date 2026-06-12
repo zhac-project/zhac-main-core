@@ -22,8 +22,13 @@ bool lua_engine_init(void);
 
 // Scan `/spiffs/scripts/*.lua` (or the NVS-backed alternative) and
 // spawn a top-level coroutine for each. Registrations (on_attr_change,
-// on_mqtt, on_cron, on_boot) are recorded here so subsequent EventBus
-// events can dispatch into them.
+// on_mqtt, on_cron, on_boot) are recorded as each script first runs so
+// subsequent EventBus events can dispatch into them.
+//
+// Asynchronous: enqueues the pass onto TaskLua — the only task allowed
+// to touch the lua_State — and returns immediately. Scripts compile and
+// start when TaskLua drains the message; anything queued behind it sees
+// every script's top-level registrations already in place.
 void lua_engine_load_all(void);
 
 // Enqueue a resume for any coroutines subscribed to `event`. Non-

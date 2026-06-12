@@ -7,11 +7,9 @@
 #if CONFIG_LUA_ENGINE_ENABLED
 
 #include "esp_log.h"
-#include "esp_heap_caps.h"
 
 #include "lua_alloc.h"
 #include "lua_engine.h"
-#include "lua_engine_scripts.h"
 #include "lua_internal.h"
 #include "lua_scheduler.h"
 
@@ -76,49 +74,21 @@ uint16_t lua_engine_live_coroutines(void)  { return lua_scheduler_live_count(); 
 uint32_t lua_engine_error_count(void)      { return lua_scheduler_error_count(); }
 uint32_t lua_engine_yield_count(void)      { return lua_scheduler_yield_count(); }
 
-// Compile + run one cached script as a top-level coroutine. Each file
-// gets its own coroutine so an error or `zhac.sleep` in one script
-// doesn't block the others.
-static bool load_one_script(lua_State* L, const char* name) {
-    // Park 16 KB script-load scratch in PSRAM. One-shot lazy init,
-    // never freed — same lifetime as the original BSS-static array.
-    enum { kBufSz = 16 * 1024 };
-    static char* buf = NULL;
-    if (!buf) {
-        buf = (char*)heap_caps_malloc(kBufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!buf) buf = (char*)heap_caps_malloc(kBufSz, MALLOC_CAP_8BIT);
-        if (!buf) {
-            ESP_LOGE(TAG, "load_one_script: buf alloc failed");
-            return false;
-        }
-    }
-    const int n = lua_script_cache_read(name, buf, kBufSz);
-    if (n < 0) {
-        ESP_LOGW(TAG, "script '%s' not readable", name);
-        return false;
-    }
-    if (luaL_loadbufferx(L, buf, (size_t)n, name, "t") != LUA_OK) {
-        ESP_LOGE(TAG, "compile '%s': %s", name, lua_tostring(L, -1));
-        lua_pop(L, 1);
-        return false;
-    }
-    // Spawn consumes the function on top of L and schedules it.
-    if (lua_scheduler_spawn(L) < 0) {
-        ESP_LOGE(TAG, "spawn '%s' failed", name);
-        return false;
-    }
-    return true;
-}
-
 void lua_engine_load_all(void) {
     if (!g_L) return;
-    LuaScriptEntry entries[LUA_SCRIPT_MAX];
-    const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
-    uint16_t loaded = 0;
-    for (uint16_t i = 0; i < n; ++i) {
-        if (load_one_script(g_L, entries[i].name)) loaded++;
+    // Compiling + spawning here — on the caller's task — raced TaskLua,
+    // which may already be resuming previously spawned coroutines on the
+    // same g_L (the first script's spawn pushes an immediate resume).
+    // lua_State has no internal locking, so two tasks inside the VM
+    // corrupt it as soon as a second stored script exists. Hand the
+    // whole pass to TaskLua instead (MSG_LOAD_ALL; body lives in
+    // lua_scheduler.cpp): same per-script failure tolerance, but every
+    // lua_State touch now serialises on the one task that owns it.
+    // Fire-and-forget — the one caller (app_main) never consumed a
+    // result and nothing downstream depends on scripts having started.
+    if (!lua_scheduler_push_load_all()) {
+        ESP_LOGE(TAG, "load_all: resume queue full — stored scripts not started");
     }
-    ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
 }
 
 // EventBus → Lua dispatcher. The full struct layouts for Event /

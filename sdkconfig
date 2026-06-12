@@ -1287,8 +1287,6 @@ CONFIG_PARTITION_TABLE_MD5=y
 # default:
 CONFIG_ZHAC_NCP_ZNP=y
 # default:
-# CONFIG_ZHAC_NCP_EZSP is not set
-# default:
 # CONFIG_ZHAC_NCP_C6 is not set
 
 #
@@ -3968,18 +3966,14 @@ CONFIG_METRICS_EXPORT_PREFIX="zhac"
 # MQTT Gateway
 #
 # default:
-CONFIG_MQTT_BROKER_URL="mqtt://localhost"
+CONFIG_MQTT_BROKER_URL=""
 # end of MQTT Gateway
 
 #
 # ZHAC EZSP NCP
 #
 # default:
-CONFIG_ZHAC_EZSP_UART_TX_GPIO=26
-# default:
-CONFIG_ZHAC_EZSP_UART_RX_GPIO=27
-# default:
-CONFIG_ZHAC_EZSP_UART_RST_GPIO=28
+# CONFIG_ZHAC_EZSP_BACKEND_ENABLE is not set
 # end of ZHAC EZSP NCP
 
 #

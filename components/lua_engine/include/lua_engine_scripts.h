@@ -16,6 +16,12 @@ extern "C" {
 
 #define LUA_SCRIPT_NAME_MAX 24   // chars, excluding NUL terminator
 #define LUA_SCRIPT_MAX      16   // soft cap on distinct files
+// T20: single source of truth for the max stored Lua source size. The
+// write path, the read buffers (run_named / load_one), and the oversize
+// read-reject all key off this instead of divergent 8 KB / 16 KB
+// literals that let an oversize script slip past one limit and truncate
+// at another. Excludes the NUL terminator (read buffers add +1).
+#define LUA_SCRIPT_SRC_MAX  (16 * 1024)
 
 typedef struct {
     char     name[LUA_SCRIPT_NAME_MAX + 1];

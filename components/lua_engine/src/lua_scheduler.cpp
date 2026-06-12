@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // lua_scheduler.c — TaskLua + resume queue + timer pool.
 //
-// Single-threaded: TaskLua is the only task that ever touches g_L.
+// Single-threaded: TaskLua is the only task that ever touches g_L —
+// including the boot-time script load, which rides MSG_LOAD_ALL.
 // External code reaches Lua by pushing a ResumeMsg onto s_resume_q;
 // the scheduler dequeues, resumes the target coroutine, and on
 // yield/finish updates the registry-held reference.
@@ -16,11 +17,13 @@
 #if CONFIG_LUA_ENGINE_ENABLED
 
 #include <atomic>
+#include <csetjmp>
 #include <cstdint>
 #include <cstring>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -34,8 +37,52 @@ extern "C" {
 #include "lua_scheduler.h"
 }
 #include "metrics/metrics_macros.h"
+// T20: derive the ZclAttrEvent payload layout from the canonical schema
+// constants instead of hardcoded offsets. event_bus schema v6 widened
+// ATTR_KEY_MAX 20→28, which slid the value union from offset 36 to 44;
+// the old literals silently fed on_attr_change handlers 0/garbage ints
+// and truncated key/value strings. Pull the header so the offsets track
+// the struct automatically if the schema moves again.
+#include "zcl_attribute.h"
+#include "event_bus.h"
 
 static const char* TAG = "lua_sched";
+
+// ── Panic backstop (T20) ──────────────────────────────────────────────
+// The scheduler touches the VM from unprotected frames on TaskLua:
+// lua_newthread / luaL_ref / lua_pushstring in spawn_coroutine and the
+// push_event_args / run_named_script marshalling run with NO pcall above
+// them. If the budget allocator returns NULL there (script drove the
+// heap to the cap), Lua raises "not enough memory" with no handler to
+// catch it and calls the panic function — whose default is abort(), i.e.
+// every such event becomes a chip reboot.
+//
+// Fix: install a lua_atpanic handler that longjmps back to a setjmp
+// frame wrapped around each dispatch step in task_lua (the standard
+// embedded "panic = unwind one step, keep the VM" pattern). The bad
+// dispatch is abandoned and counted; TaskLua loops and serves the next
+// message. The VM stays up. NOTE: longjmp out of a panic leaves the
+// offending lua_State's stack unbalanced, but we only ever longjmp on a
+// genuinely unrecoverable raise (OOM/internal) where that thread is
+// being discarded anyway — g_L itself is not left mid-API-call because
+// the panic fires synchronously inside the C API call we abandon.
+static std::jmp_buf s_panic_jmp;
+static volatile bool s_panic_armed = false;
+
+static int lua_panic_handler(lua_State* L) {
+    const char* msg = lua_tostring(L, -1);
+    ESP_LOGE(TAG, "lua panic (unprotected error) — abandoning dispatch step: %s",
+             msg ? msg : "(no message)");
+    lua_scheduler_error_bump();
+    if (s_panic_armed) {
+        s_panic_armed = false;
+        std::longjmp(s_panic_jmp, 1);   // unwind to task_lua's per-step frame
+    }
+    // No frame armed (shouldn't happen on TaskLua) — fall through to the
+    // default behaviour (abort) rather than returning, which Lua treats
+    // as "panic handler returned" and aborts anyway.
+    return 0;
+}
 
 // ── CPU runaway guard (LUA-F1) ────────────────────────────────────────
 // Single-threaded TaskLua ⇒ one tight loop wedges every coroutine and
@@ -94,14 +141,18 @@ static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
 
 // ── Resume queue ──────────────────────────────────────────────────────
 //
-// Two message kinds share one queue:
-//  - MSG_RESUME: resume an existing coroutine by registry ref.
-//  - MSG_EVENT:  iterate a REG_ON_* table and spawn a coroutine per
-//                handler, passing unpacked event fields.
+// Message kinds sharing one queue:
+//  - MSG_RESUME:    resume an existing coroutine by registry ref.
+//  - MSG_EVENT:     iterate a REG_ON_* table and spawn a coroutine per
+//                   handler, passing unpacked event fields.
+//  - MSG_RUN_NAMED: compile + run one named script from the cache.
+//  - MSG_LOAD_ALL:  boot-time pass — compile + start every stored
+//                   script. No payload.
 enum LuaMsgKind : uint8_t {
     MSG_RESUME    = 0,
     MSG_EVENT     = 1,
     MSG_RUN_NAMED = 2,
+    MSG_LOAD_ALL  = 3,
 };
 
 enum LuaEventKind : uint8_t {
@@ -125,8 +176,11 @@ typedef struct {
 typedef struct {
     char     name[32];            // script identifier (no extension)
     char     value[64];           // stringified trigger value; "" when unused
-    char     key[20];             // attr name; "" for non-attr triggers
-    char     str_val[32];         // raw VAL_STR value; "" otherwise
+    // T20: size key/str_val from the schema-v6 constants, not the old
+    // 20/32 literals — an attr key up to ATTR_KEY_MAX or a VAL_STR up to
+    // ATTR_STR_MAX was being truncated before reaching the handler.
+    char     key[ATTR_KEY_MAX];   // attr name; "" for non-attr triggers
+    char     str_val[ATTR_STR_MAX]; // raw VAL_STR value; "" otherwise
     uint64_t ieee;                // source device IEEE; 0 when absent
     uint16_t cluster;             // ZCL cluster id; 0 when absent
     uint16_t attr_id;             // ZCL attribute id; 0 when absent
@@ -200,8 +254,15 @@ static void on_timer_fire(void* arg) {
     // and pin a timer slot + coroutine forever. Keep the slot and re-arm to
     // retry shortly; the ref rides along in the slot until TaskLua drains.
     if (xQueueSend(s_resume_q, &m, 0) == pdTRUE) {
-        slot->in_use        = false;
+        // T20 (slot store order): clear coroutine_ref BEFORE releasing
+        // in_use. on_timer_fire runs on the esp_timer task while
+        // slot_acquire runs on TaskLua; if in_use dropped first, a
+        // cross-task slot_acquire between the two stores would write the
+        // new ref and then this store would clobber it back to -1,
+        // orphaning the freshly-parked coroutine. Ref-then-flag closes
+        // the window (the slot isn't claimable until in_use is false).
         slot->coroutine_ref = -1;
+        slot->in_use        = false;
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
@@ -302,7 +363,95 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
     return ok;
 }
 
+// Boot-time script load. lua_engine_load_all() pushes this instead of
+// compiling + spawning on its caller's task: TaskLua may already be
+// resuming earlier coroutines on the same lua_State, and the VM has no
+// internal locking — every touch must come from TaskLua. Called once
+// from app_main strictly after lua_engine_init() succeeded (which is
+// what creates s_resume_q), the same init-before-push ordering every
+// other push_* relies on. Returns false when the queue is full.
+extern "C" bool lua_scheduler_push_load_all(void) {
+    LuaMsg m = {};
+    m.kind = MSG_LOAD_ALL;
+    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+    return ok;
+}
+
 // ── Coroutine driver ──────────────────────────────────────────────────
+//
+// Registry-ref ownership map — keep in sync with zhac_lua_module.cpp:
+//
+//   spawn ref   taken by spawn_coroutine() (dispatch_event /
+//               run_named_script / load_one_script /
+//               lua_scheduler_spawn (currently unused)) to anchor the
+//               fresh thread while it runs. Settled by
+//               resume_and_settle() on every outcome of the resume it
+//               drives (for lua_scheduler_spawn the ref rides a
+//               MSG_RESUME and is settled by resume_coroutine).
+//   sleep ref   zhac.sleep takes a FRESH ref to the running thread on
+//               every call, parks it in a TimerSlot, then yields. From
+//               that point it is the single owner of the suspended
+//               coroutine; on timer fire it rides MSG_RESUME into
+//               resume_coroutine and is settled there.
+//
+// Invariant: exactly ONE live registry ref per suspended coroutine —
+// the one held by whatever will resume it. Whoever calls lua_resume
+// must release the ref it came in with on ALL paths: LUA_OK / error
+// (thread finished — unref + live-count exit) and LUA_YIELD too,
+// because the continuation armed during the yield holds its own fresh
+// ref. Known exception: a script calling bare `coroutine.yield()`
+// with no sleep slot armed gets its ref dropped all the same — the
+// thread becomes GC-able and is never resumed (orphaned by design;
+// its live-count slot stays — pre-existing drift; see lua_sandbox.c,
+// which keeps coroutine.yield exposed).
+
+// Drives one lua_resume step of `co` (nargs args already pushed on co)
+// and settles `ref`, the registry ref the caller holds on the thread.
+// The ref is released on EVERY path; after a LUA_YIELD the thread
+// stays anchored by the fresh ref the yield path (zhac.sleep) took
+// before yielding. `err_ctx` prefixes the error log so each call site
+// keeps its existing message.
+static void resume_and_settle(lua_State* L, lua_State* co, int ref,
+                              int nargs, const char* err_ctx) {
+    int nres = 0;
+    arm_resume_deadline(co);
+    const int status = lua_resume(co, L, nargs, &nres);
+
+    if (status == LUA_YIELD) {
+        lua_pop(co, nres);
+        lua_scheduler_yield_bump();
+        // The continuation (sleep timer slot) owns its own ref now;
+        // ours is redundant — dropping it is what keeps the registry
+        // at one slot per suspended coroutine.
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        return;
+    }
+    if (status != LUA_OK) {
+        const char* err = lua_tostring(co, -1);
+        ESP_LOGE(TAG, "%s: %s", err_ctx, err ? err : "(no message)");
+        lua_scheduler_error_bump();
+    }
+    lua_pop(co, (status == LUA_OK) ? nres : 1);
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    lua_scheduler_coroutine_exit();
+}
+
+// Spawns a coroutine from the function on top of L's stack (consumed)
+// and anchors it with a fresh registry ref stored in *out_ref. Returns
+// NULL on registry exhaustion (function gone, no live-count taken).
+// Capacity checks stay at the call sites — message and control flow
+// differ per site.
+static lua_State* spawn_coroutine(lua_State* L, int* out_ref) {
+    lua_State* co = lua_newthread(L);   // [..., fn, co]
+    lua_insert(L, -2);                  // [..., co, fn]
+    lua_xmove(L, co, 1);                // fn → co. L: [..., co]
+    *out_ref = luaL_ref(L, LUA_REGISTRYINDEX);   // consumes co
+    if (*out_ref == LUA_NOREF) return NULL;
+    lua_scheduler_coroutine_enter();
+    return co;
+}
+
 static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, r->coroutine_ref);
     lua_State* co = lua_tothread(L, -1);
@@ -315,25 +464,7 @@ static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
 
     for (int i = 0; i < r->argc; ++i) lua_pushinteger(co, r->argv[i]);
 
-    int nres = 0;
-    arm_resume_deadline(co);
-    const int status = lua_resume(co, L, r->argc, &nres);
-
-    if (status == LUA_OK) {
-        lua_pop(co, nres);
-        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
-        lua_scheduler_coroutine_exit();
-    } else if (status == LUA_YIELD) {
-        lua_pop(co, nres);
-        lua_scheduler_yield_bump();
-    } else {
-        const char* err = lua_tostring(co, -1);
-        ESP_LOGE(TAG, "coroutine error: %s", err ? err : "(no message)");
-        lua_pop(co, 1);
-        luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
-        lua_scheduler_coroutine_exit();
-        lua_scheduler_error_bump();
-    }
+    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error");
 }
 
 // Marshal event fields onto a coroutine's stack. Returns argc.
@@ -350,15 +481,21 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_newtable(co);
             return 1;
         case LUA_EVT_ATTR: {
-            // ZclAttrEvent layout (packed, 96 B): ieee(8), nwk(2), ep(1),
-            // val_type(1), cluster(2), attr_id(2), key[20], union{int32
-            // or str[32]}, pad.
+            // ZclAttrEvent layout (packed, 96 B, schema v6): ieee(8),
+            // nwk(2), ep(1), val_type(1), cluster(2), attr_id(2),
+            // key[ATTR_KEY_MAX=28], union{int32_t int_val | char
+            // str_val[ATTR_STR_MAX=48]}, _pad(4). T20: read every field
+            // through offsetof on the canonical struct so the value union
+            // is at offset 44 (v6) — the previous hardcoded 36 was the v5
+            // offset (key was [20]) and fed handlers garbage after the
+            // schema widened. The struct is the single source of truth.
             const uint8_t* p = e->payload;
-            uint64_t ieee;    memcpy(&ieee, p + 0, 8);
-            uint16_t cluster; memcpy(&cluster, p + 12, 2);
-            uint16_t attr_id; memcpy(&attr_id, p + 14, 2);
-            const char* key = (const char*)(p + 16);
-            const uint8_t val_type = p[11];
+            uint64_t ieee;    memcpy(&ieee,    p + offsetof(ZclAttrEvent, ieee),    8);
+            uint16_t cluster; memcpy(&cluster, p + offsetof(ZclAttrEvent, cluster), 2);
+            uint16_t attr_id; memcpy(&attr_id, p + offsetof(ZclAttrEvent, attr_id), 2);
+            const char* key = (const char*)(p + offsetof(ZclAttrEvent, key));
+            const uint8_t val_type = p[offsetof(ZclAttrEvent, val_type)];
+            const size_t  val_off  = offsetof(ZclAttrEvent, int_val);  // == str_val (union)
             // val_type: 0=INT, 1=BOOL, 2=STR (see attr_keys.h).
             char ieee_hex[20];
             snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
@@ -366,12 +503,12 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_pushstring(co, ieee_hex);
             lua_pushstring(co, key);
             if (val_type == 2) {
-                lua_pushstring(co, (const char*)(p + 36));
+                lua_pushstring(co, (const char*)(p + val_off));
             } else if (val_type == 1) {
-                int32_t v; memcpy(&v, p + 36, 4);
+                int32_t v; memcpy(&v, p + val_off, 4);
                 lua_pushboolean(co, v != 0);
             } else {
-                int32_t v; memcpy(&v, p + 36, 4);
+                int32_t v; memcpy(&v, p + val_off, 4);
                 lua_pushinteger(co, v);
             }
             lua_pushinteger(co, cluster);
@@ -450,45 +587,17 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
             break;
         }
 
-        lua_State* co = lua_newthread(L);
-        // Stack now: [..., handlers_tbl, fn, co]. Reorder to
-        // [handlers_tbl, co, fn] then xmove fn onto co.
-        lua_insert(L, -2);              // [handlers_tbl, co, fn]
-        lua_xmove(L, co, 1);            // fn → co. L: [handlers_tbl, co]
+        int ref = LUA_NOREF;
+        lua_State* co = spawn_coroutine(L, &ref);   // consumes fn
+        if (!co) continue;
 
         const int argc = push_event_args(co, e);
 
-        // Hold a ref so the thread isn't GC'd while we resume.
-        lua_pushvalue(L, -1);           // duplicate thread for ref
-        const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-        if (ref == LUA_NOREF) {
-            lua_pop(L, 1);              // pop thread
-            continue;
-        }
-
-        lua_scheduler_coroutine_enter();
-
         // Run the coroutine inline. Args are already on co; pass argc
-        // as nargs so Lua hands them to the function.
-        int nres = 0;
-        arm_resume_deadline(co);
-        const int status = lua_resume(co, L, argc, &nres);
-        if (status == LUA_YIELD) {
-            lua_pop(co, nres);
-            lua_scheduler_yield_bump();
-            // Ref stays live; the yield path (zhac.sleep etc.) is
-            // responsible for pushing a resume when ready.
-        } else {
-            if (status != LUA_OK) {
-                const char* err = lua_tostring(co, -1);
-                ESP_LOGE(TAG, "handler error: %s", err ? err : "(no message)");
-                lua_scheduler_error_bump();
-            }
-            lua_pop(co, (status == LUA_OK) ? nres : 1);
-            luaL_unref(L, LUA_REGISTRYINDEX, ref);
-            lua_scheduler_coroutine_exit();
-        }
-        lua_pop(L, 1);                   // pop thread from L
+        // as nargs so Lua hands them to the function. Our spawn ref is
+        // settled on every outcome — on yield, zhac.sleep's own ref
+        // takes over and the timer slot pushes the resume when ready.
+        resume_and_settle(L, co, ref, argc, "handler error");
     }
     lua_pop(L, 1);                       // handler table
 }
@@ -499,8 +608,11 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
 // val_type, int_val, str_val}); fields are zero / "" for non-device
 // triggers. Returns after the coroutine either yields or terminates.
 static void run_named_script(lua_State* L, const RunNamedArgs* r) {
-    // 8 KB script source scratch lives in PSRAM. Lazy one-shot init.
-    constexpr size_t kBufSz = 8192;
+    // Script source scratch lives in PSRAM. Lazy one-shot init. T20:
+    // size to LUA_SCRIPT_SRC_MAX (+1 NUL) — the unified store cap — so a
+    // legitimately large stored script isn't silently truncated at an 8
+    // KB buffer that was smaller than the write limit.
+    constexpr size_t kBufSz = LUA_SCRIPT_SRC_MAX + 1;
     static char* buf = nullptr;
     if (!buf) {
         buf = static_cast<char*>(
@@ -527,9 +639,9 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
         lua_pop(L, 1);                                 // drop compiled fn
         return;
     }
-    lua_State* co = lua_newthread(L);                 // [fn, co]
-    lua_insert(L, -2);                                 // [co, fn]
-    lua_xmove(L, co, 1);                               // fn → co. L: [co]
+    int ref = LUA_NOREF;
+    lua_State* co = spawn_coroutine(L, &ref);          // consumes fn
+    if (!co) return;
 
     // Push a single event-context table as the call argument. Callers
     // that only care about the stringified value still get it via
@@ -546,47 +658,143 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     lua_pushinteger(co, (lua_Integer)r->int_val);  lua_setfield(co, -2, "int_val");
     const int argc = 1;
 
-    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);    // consumes co
-    if (ref == LUA_NOREF) return;
-    lua_scheduler_coroutine_enter();
+    char err_ctx[48];   // "lua.run '<name≤31>' error" — worst case 47 + NUL
+    snprintf(err_ctx, sizeof(err_ctx), "lua.run '%s' error", r->name);
+    resume_and_settle(L, co, ref, argc, err_ctx);
+}
 
-    int nres = 0;
-    arm_resume_deadline(co);
-    const int status = lua_resume(co, L, argc, &nres);
-    if (status == LUA_YIELD) {
-        lua_pop(co, nres);
-        lua_scheduler_yield_bump();
-    } else {
-        if (status != LUA_OK) {
-            const char* err = lua_tostring(co, -1);
-            ESP_LOGE(TAG, "lua.run '%s' error: %s",
-                     r->name, err ? err : "(no message)");
-            lua_scheduler_error_bump();
+// ── Boot-time load-all (MSG_LOAD_ALL) ─────────────────────────────────
+//
+// Body of lua_engine_load_all(). It ran on app_main until the P0
+// findings review: app_main compiled + spawned stored scripts on g_L
+// while TaskLua — unpinned, genuinely parallel on the dual-core P4 —
+// could already be resuming script 1's coroutine (its spawn pushed an
+// immediate MSG_RESUME). Two tasks inside one unlocked lua_State
+// corrupt the VM as soon as a second stored script exists. The pass
+// now rides MSG_LOAD_ALL and executes here, on TaskLua, like every
+// other lua_State touch.
+
+// Compile + run one cached script as a top-level coroutine. Each file
+// gets its own coroutine so an error or `zhac.sleep` in one script
+// doesn't block the others.
+static bool load_one_script(lua_State* L, const char* name) {
+    // Park script-load scratch in PSRAM. One-shot lazy init, never freed
+    // — same lifetime as the original BSS-static array. T20: size from
+    // LUA_SCRIPT_SRC_MAX (+1 NUL), the unified store cap (was a bare
+    // 16 KB literal).
+    constexpr size_t kBufSz = LUA_SCRIPT_SRC_MAX + 1;
+    static char* buf = nullptr;
+    if (!buf) {
+        buf = static_cast<char*>(
+            heap_caps_malloc(kBufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!buf) buf = static_cast<char*>(heap_caps_malloc(kBufSz, MALLOC_CAP_8BIT));
+        if (!buf) {
+            ESP_LOGE(TAG, "load_one_script: buf alloc failed");
+            return false;
         }
-        lua_pop(co, (status == LUA_OK) ? nres : 1);
-        luaL_unref(L, LUA_REGISTRYINDEX, ref);
-        lua_scheduler_coroutine_exit();
     }
+    const int n = lua_script_cache_read(name, buf, kBufSz);
+    if (n < 0) {
+        ESP_LOGW(TAG, "script '%s' not readable", name);
+        return false;
+    }
+    if (luaL_loadbufferx(L, buf, (size_t)n, name, "t") != LUA_OK) {
+        ESP_LOGE(TAG, "compile '%s': %s", name, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return false;
+    }
+    if (lua_scheduler_at_capacity()) {
+        ESP_LOGW(TAG, "lua: coroutine cap %d reached — skipping '%s'",
+                 CONFIG_LUA_ENGINE_MAX_COROUTINES, name);
+        lua_pop(L, 1);                                 // drop compiled fn
+        return false;
+    }
+    int ref = LUA_NOREF;
+    lua_State* co = spawn_coroutine(L, &ref);          // consumes fn
+    if (!co) {
+        ESP_LOGE(TAG, "spawn '%s' failed", name);
+        return false;
+    }
+    // First resume runs inline — we ARE TaskLua here, so detouring
+    // through lua_scheduler_spawn's push-MSG_RESUME-to-self would burn
+    // up to LUA_SCRIPT_MAX queue slots while this handler holds the
+    // task (deterministic overflow at the Kconfig-minimum depth of 8)
+    // and would let an already-queued event dispatch BEFORE the
+    // scripts' top-level registrations run. Inline keeps the original
+    // ordering: once MSG_LOAD_ALL is handled, every script has run to
+    // its first yield/finish, so events behind it see all handlers.
+    char err_ctx[48];   // "script '<name≤24>' error" — worst case 39 + NUL
+    // %.24s: cache names are char[25], but the compiler can't see that
+    // bound through the const char* param (-Werror=format-truncation).
+    snprintf(err_ctx, sizeof(err_ctx), "script '%.24s' error", name);
+    resume_and_settle(L, co, ref, 0, err_ctx);
+    return true;   // loaded = compiled + started; runtime errors are
+                   // logged/counted by resume_and_settle, as before
+}
+
+// Iterate the SPIFFS script cache, compile + start each entry. A bad
+// script is logged and skipped, NEVER allowed to abort the loop — one
+// broken file must not take the rest down or boot-loop the node.
+static void load_all_scripts(lua_State* L) {
+    LuaScriptEntry entries[LUA_SCRIPT_MAX];
+    const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
+    uint16_t loaded = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        if (load_one_script(L, entries[i].name)) loaded++;
+    }
+    ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
 }
 
 static void task_lua(void* arg) {
     lua_State* L = (lua_State*)arg;
     ESP_LOGI(TAG, "TaskLua started");
+    // T20: real watchdog coverage. esp_task_wdt_add(NULL) subscribes
+    // THIS task; the loop resets it every iteration. The receive timeout
+    // (below) keeps the period under the configured WDT window even when
+    // the engine is idle, so a genuinely wedged TaskLua (tight in-C loop,
+    // deadlock) trips the WDT while normal idle never false-trips.
+    esp_task_wdt_add(nullptr);
     LuaMsg m;
     for (;;) {
-        if (xQueueReceive(s_resume_q, &m, portMAX_DELAY) != pdTRUE) continue;
+        // T20: feed the task watchdog from the loop head. The receive
+        // below uses a finite timeout (not portMAX_DELAY) so an idle
+        // engine still wakes periodically to pet the WDT instead of
+        // looking wedged. main.cpp subscribes TaskLua to the TWDT.
+        esp_task_wdt_reset();
+        if (xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(2000)) != pdTRUE) continue;
+
+        // T20 (panic backstop): wrap every VM-touching dispatch step in a
+        // setjmp frame so an unprotected OOM/internal raise (e.g. inside
+        // lua_newthread / luaL_ref / pushstring, which run with no pcall
+        // above them) longjmps here via lua_panic_handler instead of
+        // abort()ing the chip. On a panic we just drop this one message
+        // and loop — the engine survives a single bad dispatch.
+        if (setjmp(s_panic_jmp) != 0) {
+            // Returned from a panic longjmp — step already logged/counted.
+            s_panic_armed = false;
+            continue;
+        }
+        s_panic_armed = true;
+
         if (m.kind == MSG_RESUME) {
             resume_coroutine(L, &m.resume);
         } else if (m.kind == MSG_EVENT) {
             dispatch_event(L, &m.event);
         } else if (m.kind == MSG_RUN_NAMED) {
             run_named_script(L, &m.named);
+        } else if (m.kind == MSG_LOAD_ALL) {
+            load_all_scripts(L);
         }
+
+        s_panic_armed = false;
     }
 }
 
 // Spawn a coroutine from a Lua function on top of L's stack. Consumes
 // the function value. Returns the registry ref, or LUA_NOREF on OOM.
+// NOTE: no in-tree callers since MSG_LOAD_ALL (load_all now spawns
+// inline on TaskLua); kept for off-TaskLua use (mono-core port may
+// need it) — removal candidate.
 extern "C" int lua_scheduler_spawn(lua_State* L) {
     if (!lua_isfunction(L, -1)) return LUA_NOREF;
     if (lua_scheduler_at_capacity()) {
@@ -595,17 +803,11 @@ extern "C" int lua_scheduler_spawn(lua_State* L) {
         return LUA_NOREF;
     }
 
-    lua_State* co = lua_newthread(L);
-    // Stack now: [..., function, thread]. Move the function to the
-    // new coroutine's stack.
-    lua_pushvalue(L, -2);      // copy function
-    lua_xmove(L, co, 1);       // move to coroutine
-    lua_remove(L, -2);         // drop the original function
+    int ref = LUA_NOREF;
+    if (!spawn_coroutine(L, &ref)) return LUA_NOREF;   // consumes fn
 
-    const int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    if (ref == LUA_NOREF) return LUA_NOREF;
-
-    lua_scheduler_coroutine_enter();
+    // The ref rides the MSG_RESUME; resume_coroutine settles it on
+    // every outcome (resume_and_settle).
     lua_scheduler_push_resume(ref);
     return ref;
 }
@@ -617,6 +819,11 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
         ESP_LOGE(TAG, "resume queue create failed");
         return false;
     }
+
+    // T20: route VM panics (unprotected raises — OOM at the budget cap,
+    // internal errors) through our handler so they unwind to task_lua's
+    // per-step setjmp frame instead of abort()ing the chip.
+    lua_atpanic(L, lua_panic_handler);
 
     BaseType_t ok = xTaskCreate(task_lua, "TaskLua",
                                  CONFIG_LUA_ENGINE_TASK_STACK_BYTES,
