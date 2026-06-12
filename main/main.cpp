@@ -198,20 +198,32 @@ extern "C" void app_main() {
     // logs that forward over HAP as LOG_LINE; at 10 Hz device traffic that
     // saturates the slave TX queue and causes real ALERT/EVT drops.
 
-    // TDD Section 8.1: task priorities and stack sizes
+    // TDD Section 8.1: task priorities and stack sizes.
+    // P5 (FINDINGS §1): a failed xTaskCreate* (heap exhaustion at boot)
+    // used to be silently dropped, leaving the firmware running with a
+    // core task missing. Capture each result and log it at ERROR so the
+    // failure is diagnosable. We log rather than abort(): a reboot loop on
+    // a transient low-heap boot is worse than a degraded-but-up device,
+    // and the stack monitor / heartbeat surface the missing task.
+    auto check_task = [](BaseType_t rc, const char* name) {
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "xTaskCreate(%s) FAILED rc=%d — task NOT running "
+                          "(out of heap?)", name, (int)rc);
+        }
+    };
 #if !defined(CONFIG_ZHAC_NCP_EZSP)
-    xTaskCreatePinnedToCore(task_zigbee,    "TaskZigbee",    zhac::stack::kZigbee, nullptr, 5, nullptr, 0);
+    check_task(xTaskCreatePinnedToCore(task_zigbee, "TaskZigbee", zhac::stack::kZigbee, nullptr, 5, nullptr, 0), "TaskZigbee");
 #endif
     // TaskLua is created internally by lua_engine_init()
-    xTaskCreatePinnedToCore(task_hap,       "TaskHAP",       zhac::stack::kHapP4, nullptr, 4, nullptr, 0);
-    xTaskCreate(             task_event_bus,"TaskEventBus",  zhac::stack::kEventBus, nullptr, 2, nullptr);
-    xTaskCreate(             task_log_drain,"TaskLog",       zhac::stack::kLog, nullptr, 1, nullptr);
-    xTaskCreate(             task_stack_mon,"TaskStackMon",  zhac::stack::kStackMonP4, nullptr, 1, nullptr);
-    xTaskCreate(             task_buttons,  "TaskButtons",   zhac::stack::kButtons, nullptr, 1, nullptr);
+    check_task(xTaskCreatePinnedToCore(task_hap, "TaskHAP", zhac::stack::kHapP4, nullptr, 4, nullptr, 0), "TaskHAP");
+    check_task(xTaskCreate(task_event_bus, "TaskEventBus", zhac::stack::kEventBus, nullptr, 2, nullptr), "TaskEventBus");
+    check_task(xTaskCreate(task_log_drain, "TaskLog", zhac::stack::kLog, nullptr, 1, nullptr), "TaskLog");
+    check_task(xTaskCreate(task_stack_mon, "TaskStackMon", zhac::stack::kStackMonP4, nullptr, 1, nullptr), "TaskStackMon");
+    check_task(xTaskCreate(task_buttons, "TaskButtons", zhac::stack::kButtons, nullptr, 1, nullptr), "TaskButtons");
 
 #ifdef CONFIG_HAP_BENCHMARK
     extern void task_hap_bench(void*);
-    xTaskCreatePinnedToCore(task_hap_bench, "hap_bench", zhac::stack::kHapBench, nullptr, 3, nullptr, 0);
+    check_task(xTaskCreatePinnedToCore(task_hap_bench, "hap_bench", zhac::stack::kHapBench, nullptr, 3, nullptr, 0), "hap_bench");
 #endif
 
     vTaskDelete(nullptr);

@@ -839,9 +839,17 @@ static void handle_script_delete(const HapFrame& f) {
         send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
         return;
     }
-    lua_script_cache_delete(name_raw);
-    result.ok = true;
-    ESP_LOGI(TAG, "SCRIPT_DELETE name=%s", name_raw);
+    // P5 (FINDINGS §2/§3): honour the delete result instead of acking ok
+    // unconditionally. lua_script_cache_delete returns false on an invalid
+    // name, an unmounted FS, or a path-build failure — previously the S3
+    // was told the delete succeeded in those cases.
+    result.ok = lua_script_cache_delete(name_raw);
+    if (result.ok) {
+        ESP_LOGI(TAG, "SCRIPT_DELETE name=%s", name_raw);
+    } else {
+        strncpy(result.err, "delete failed", sizeof(result.err) - 1);
+        ESP_LOGW(TAG, "SCRIPT_DELETE failed name=%s", name_raw);
+    }
     send_exec_result(HapMsgType::SCRIPT_ACK, result, f.seq);
 }
 
@@ -1295,6 +1303,16 @@ void zigbee_factory_reset();
 
 namespace {
 
+// P5 (FINDINGS §2): a single HAP frame triggers an irreversible factory
+// wipe + reboot, with no nonce/handshake. This is INTENTIONAL under the
+// dual-chip trust model: the SPI/HAP link between the P4 and the S3 is a
+// private board-internal bus, not an external attack surface — the S3 is
+// the sole authenticated peer (it terminates the network auth / sessions)
+// and is treated as trusted. An attacker able to forge frames on this bus
+// already owns the device. If that trust boundary ever changes (e.g. the
+// link becomes externally reachable), this handler must gain a
+// nonce/confirm handshake — that is a deliberate design change, not a
+// drive-by hardening, and is tracked separately.
 void handle_zigbee_factory_reset_msg(const HapFrame&) {
     ESP_LOGW("p4_main", "ZIGBEE_FACTORY_RESET received from S3");
     zigbee_factory_reset();      // global; does not return

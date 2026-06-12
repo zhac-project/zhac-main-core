@@ -211,7 +211,14 @@ size_t ash_encode_rst(uint8_t* out, size_t out_cap) {
 // ══════════════════════════════════════════════════════════════════════════
 
 static void uart_send(const uint8_t* data, size_t len) {
-    uart_write_bytes(EZSP_UART, data, len);
+    // P5 (FINDINGS §13): surface a short/failed write. uart_write_bytes
+    // returns bytes queued (or -1 on bad args); a short count means the
+    // ASH frame was truncated on the wire and the NCP will NAK/time out.
+    const int written = uart_write_bytes(EZSP_UART, data, len);
+    if (written < 0 || (size_t)written != len) {
+        ESP_LOGW(TAG, "uart_send short write: queued %d of %u bytes",
+                 written, (unsigned)len);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
