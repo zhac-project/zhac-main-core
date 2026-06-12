@@ -7,9 +7,20 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
-### Security
+### Fixed
 
-- **config**: default `CONFIG_MQTT_BROKER_URL` emptied (`""`) in the tracked
+- **hap_dispatch (HOTFIX)** — `handle_get_devices` is now PAGED. The device
+  list previously timed out for anyone with ~15+ devices: a full fleet's JSON
+  exceeds one SPI frame (`HAP_MAX_PAYLOAD` = 4096; overflow confirmed at 16
+  devices), the encoder returned `false`, and the handler logged
+  "GET_DEVICES encode failed" and **returned without sending** — so the S3's
+  `GET_DEVICES` roundtrip always timed out. The handler now parses a
+  `uint16` LE `start_index` cursor from the request payload (empty/legacy
+  payload → 0), encodes one page from there via the paged
+  `hap_json_encode_device_list`, and emits a `DEVICE_LIST` whose envelope
+  carries the `next` cursor for the S3 to follow. `hap_send` now returns
+  `bool` (propagating `hap_session_send`) and the handler **checks it** —
+  a dropped reply is logged instead of silently leaving the S3 to time out.
   `sdkconfig` — it previously baked `mqtt://localhost`, a stray dev default with
   no business in a published image. The broker URL is set at runtime; defaults
   (`sdkconfig.defaults` / `sdkconfig.prod.defaults`) do not set the key, so the
