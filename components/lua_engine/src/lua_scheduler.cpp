@@ -266,7 +266,17 @@ static void on_timer_fire(void* arg) {
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
-        esp_timer_start_once(slot->handle, 10 * 1000ULL);   // retry in 10 ms
+        // P5 (FINDINGS §5): if the re-arm itself fails the slot + registry
+        // ref strand forever (never resumed, never unref'd) — and the old
+        // code dropped the esp_err silently. We cannot unref here (the
+        // ref belongs to TaskLua's lua_State, not the esp_timer task), so
+        // the safe recovery is to make the strand loud. Escalate to ERROR
+        // so a wedged sleep slot is diagnosable rather than invisible.
+        const esp_err_t rearm = esp_timer_start_once(slot->handle, 10 * 1000ULL);
+        if (rearm != ESP_OK) {
+            ESP_LOGE(TAG, "timer re-arm failed (%s) — sleep slot stranded for "
+                          "ref %d", esp_err_to_name(rearm), slot->coroutine_ref);
+        }
     }
 }
 
@@ -501,9 +511,17 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
                      (unsigned long long)ieee);
             lua_pushstring(co, ieee_hex);
-            lua_pushstring(co, key);
+            // P5 (FINDINGS §2, T2): `key` and the VAL_STR value are read
+            // straight out of the raw 96-byte event-bus payload. The
+            // canonical producers NUL-terminate (zcl_attribute.h), but the
+            // event-bus transport is generic — a non-canonical producer
+            // that fills the whole field would leave lua_pushstring (which
+            // walks to a NUL) over-reading past the field into adjacent
+            // payload bytes. Bound both pushes by the field size.
+            lua_pushlstring(co, key, strnlen(key, ATTR_KEY_MAX));
             if (val_type == 2) {
-                lua_pushstring(co, (const char*)(p + val_off));
+                const char* sv = (const char*)(p + val_off);
+                lua_pushlstring(co, sv, strnlen(sv, ATTR_STR_MAX));
             } else if (val_type == 1) {
                 int32_t v; memcpy(&v, p + val_off, 4);
                 lua_pushboolean(co, v != 0);

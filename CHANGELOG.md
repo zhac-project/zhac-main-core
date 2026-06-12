@@ -9,6 +9,41 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **P5 LOW-tail sweep (FINDINGS §1/§2/§3/§5)** — conservative honesty/robustness
+  fixes for the genuinely-open LOW rows (most LOW findings were already resolved
+  incidentally during P0–P4):
+  - `main/main.cpp` (§1) — the boot `xTaskCreate*` results were dropped; a
+    failed create (heap exhaustion at boot) left the firmware up with a core
+    task missing. Each create now flows through a `check_task` lambda that logs
+    at ERROR. Logs rather than aborts: a reboot loop on a transient low-heap boot
+    is worse than a degraded device, and the stack monitor surfaces the gap.
+    Priorities/stacks unchanged.
+  - `main/hap_dispatch.cpp` `handle_script_delete` (§2/§3) — SCRIPT_DELETE acked
+    `ok` unconditionally even when `lua_script_cache_delete` returned false (bad
+    name / unmounted FS / path-build failure). Now honours the return and NAKs
+    with `"delete failed"` so the S3 learns the truth.
+  - `components/lua_engine/src/lua_scheduler.cpp` (§5) — the resume-queue-full
+    timer **re-arm** (`esp_timer_start_once`) ignored its `esp_err_t`; a failed
+    re-arm strands the sleep slot + registry ref forever and silently. The ref
+    can't be unref'd off TaskLua, so the slot-release semantics are unchanged;
+    the failure is now escalated to ERROR (`esp_err_to_name`) so a wedged sleep
+    slot is diagnosable.
+  - `components/lua_engine/src/lua_scheduler.cpp` (§2, T2) — the on-attr-change
+    marshalling pushed `key` and the VAL_STR value with `lua_pushstring` (walks
+    to a NUL) straight from the raw 96-byte event-bus payload. Canonical
+    producers NUL-terminate, but the transport is generic; switched to
+    `lua_pushlstring` bounded by `strnlen(…, ATTR_KEY_MAX)` / `ATTR_STR_MAX` so a
+    non-canonical full-width field can't over-read into adjacent payload bytes.
+  - `components/ezsp_driver/ezsp_driver.cpp` (§13) — `uart_send` ignored
+    `uart_write_bytes`; a short/failed write (truncated ASH frame) was invisible.
+    Now logs a WARN with the queued-vs-requested byte count. (The EZSP backend is
+    gated off by default; this is a safe, gating-independent one-liner.)
+- **hap_dispatch (P5, FINDINGS §2, `hap_dispatch.cpp` `handle_zigbee_factory_reset_msg`)**
+  — documented (comment only) the intentional trust assumption behind the
+  single-frame factory wipe: the SPI/HAP link is a private board-internal bus
+  with the S3 as the sole trusted authenticated peer, so no nonce/handshake is
+  required. Noted that a change to that trust boundary would require a confirm
+  handshake as a deliberate design change. No code change.
 - **hap_slave (P4-T31, FINDINGS HAP, `hap_slave.cpp`)** — documented the
   in-place DMA-buffer dispatch lifetime. On the verified-payload path
   `peer.payload` is set to `s_rx_buf`, the LIVE DMA receive buffer, and is valid
