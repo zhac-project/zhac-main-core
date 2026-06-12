@@ -48,7 +48,7 @@ static const char* TAG = "p4_main";
 static constexpr int      BATTERY_LOW_THRESHOLD_PCT = 20;
 static constexpr uint32_t HAP_RESPONSE_TIMEOUT_MS   = 5000;
 
-void hap_send(HapMsgType type, const uint8_t* payload,
+bool hap_send(HapMsgType type, const uint8_t* payload,
               uint16_t payload_len, uint8_t flags,
               uint16_t ack_seq) {
     HapFrame f{};
@@ -58,7 +58,7 @@ void hap_send(HapMsgType type, const uint8_t* payload,
     f.flags       = flags;
     f.payload     = payload;
     f.payload_len = payload_len;
-    hap_session_send(f);
+    return hap_session_send(f);
 }
 
 // CC-F6: the BULK_STATE_UPDATE batching path (s_bulk_buf, bulk_push,
@@ -311,9 +311,25 @@ static void resolve_dev_labels(const ZapDevice* dev,
 }
 
 // ── GET_DEVICES handler ───────────────────────────────────────────────────
+// PAGED (HOTFIX): a full fleet's device-list JSON does not fit one SPI frame
+// (HAP_MAX_PAYLOAD=4096; ~16 realistic devices overflow it). The request now
+// carries a uint16 LE `start_index` cursor in its payload; we encode one page
+// from there into the tx scratch, and the DEVICE_LIST envelope carries a
+// `"next"` cursor (= index of the first un-encoded device, or device count
+// when done) that S3 follows to fetch the remaining pages. A legacy/empty
+// request payload means start_index = 0 (first page) — both sides are
+// reflashed together so the cursor is always present in practice.
 static void handle_get_devices(const HapFrame& req) {
+    // Parse the start_index cursor (uint16 LE). Empty/short payload → 0.
+    uint16_t start_index = 0;
+    if (req.payload && req.payload_len >= 2) {
+        start_index = static_cast<uint16_t>(req.payload[0] |
+                                            (req.payload[1] << 8));
+    }
+
     auto& tx_buf = hap_tx_scratch();
-    uint16_t len = 0;
+    uint16_t len  = 0;
+    uint16_t next = start_index;
     // F6/F35: hold the pool lock across the pool_all() iteration inside
     // the encoder — same contract as handle_configure_req below. The
     // encode is CPU-only (JSON into the static tx scratch; hap_json and
@@ -321,18 +337,30 @@ static void handle_get_devices(const HapFrame& req) {
     // no blocking I/O runs under the mutex; the SPI send happens after
     // unlock.
     zigbee_pool_lock();
+    const uint16_t total = pool_count();
+    // Clamp a cursor past the end to `total` so we always emit a valid
+    // (empty) terminal page with next==total rather than reading OOB.
+    if (start_index > total) start_index = total;
     bool ok = hap_json_encode_device_list(
         tx_buf, sizeof(tx_buf), &len,
-        pool_all(), pool_count(),
-        &resolve_dev_labels);
+        pool_all(), total,
+        &resolve_dev_labels,
+        start_index, &next);
     zigbee_pool_unlock();
 
     if (!ok) {
-        ESP_LOGE(TAG, "GET_DEVICES encode failed");
+        ESP_LOGE(TAG, "GET_DEVICES encode failed (start=%u total=%u)",
+                 (unsigned)start_index, (unsigned)total);
         return;
     }
 
-    hap_send(HapMsgType::DEVICE_LIST, tx_buf, len, HAP_FLAG_NEEDS_ACK, req.seq);
+    // Check the send result now: a dropped DEVICE_LIST reply used to be
+    // silent, leaving S3's roundtrip to time out with no diagnostic.
+    if (!hap_send(HapMsgType::DEVICE_LIST, tx_buf, len,
+                  HAP_FLAG_NEEDS_ACK, req.seq)) {
+        ESP_LOGE(TAG, "GET_DEVICES send failed (start=%u next=%u len=%u)",
+                 (unsigned)start_index, (unsigned)next, (unsigned)len);
+    }
 }
 
 // ── GET_DEVICE_BY_ID handler ──────────────────────────────────────────────
