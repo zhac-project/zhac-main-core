@@ -7,6 +7,14 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Security
+
+- **config**: default `CONFIG_MQTT_BROKER_URL` emptied (`""`) in the tracked
+  `sdkconfig` — it previously baked `mqtt://localhost`, a stray dev default with
+  no business in a published image. The broker URL is set at runtime; defaults
+  (`sdkconfig.defaults` / `sdkconfig.prod.defaults`) do not set the key, so the
+  empty value is not reintroduced.
+
 ### Added
 
 - **hap_dispatch**: `handle_device_options_set` applies the new per-device

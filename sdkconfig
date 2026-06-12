@@ -3966,7 +3966,7 @@ CONFIG_METRICS_EXPORT_PREFIX="zhac"
 # MQTT Gateway
 #
 # default:
-CONFIG_MQTT_BROKER_URL="mqtt://localhost"
+CONFIG_MQTT_BROKER_URL=""
 # end of MQTT Gateway
 
 #
