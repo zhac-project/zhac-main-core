@@ -8,3 +8,5 @@ compile_commands.json
 .vscode/
 .idea/
 .DS_Store
+# transient code-review scratch — never committed
+REVIEW_FINDINGS.md

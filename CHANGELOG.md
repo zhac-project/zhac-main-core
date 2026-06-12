@@ -9,6 +9,36 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_slave (P4-T31, FINDINGS HAP, `hap_slave.cpp`)** — documented the
+  in-place DMA-buffer dispatch lifetime. On the verified-payload path
+  `peer.payload` is set to `s_rx_buf`, the LIVE DMA receive buffer, and is valid
+  ONLY for the duration of the synchronous `s_cb` call (the next exchange
+  overwrites it). Added a comment making explicit that a handler MUST NOT stash
+  `peer.payload` for async use — copy out if needed. The slave dispatches in
+  place (vs the master's copy-to-dispatch-buffer) precisely because the P4 HAP
+  dispatcher is single-task (F-08) and consumes synchronously. Comment only; no
+  copy added.
+- **hap_dispatch (P4-T31, FINDINGS HAP, `hap_dispatch.cpp` `handle_metrics_req`)**
+  — routed the METRICS_RSP reply through the shared `hap_send` wrapper instead
+  of hand-rolling the `HapFrame` (`hap_make_reply` + manual `seq`/`payload`/
+  `payload_len` + `hap_session_send`). It was the only handler that open-coded
+  its reply, a drift risk. Verified field-for-field equivalence first
+  (`hap_make_reply` sets `ack_seq = f.seq`; `hap_send` reproduces seq/ack_seq/
+  flags/type/payload identically), then collapsed the 5 lines to one
+  `hap_send(METRICS_RSP, tx_buf, n, HAP_FLAG_NO_ACK, f.seq)` matching the
+  RULE_LIST_RSP site. Behaviour unchanged.
+- **hap_dispatch (P4-T31, FINDINGS HAP, `hap_dispatch.cpp` `handle_script_write`)**
+  — commented the `static char src[HAP_SCRIPT_MAX_SRC + 1]` scratch: it is
+  static (too big for the stack) and safe to share across calls ONLY because the
+  `hap_dispatch_assert_single_task()` (F-08) guard above guarantees a single
+  dispatch task; a 2nd dispatch task would alias it. Comment only.
+- **hap_dispatch (P4-T28, FINDINGS §8)** — updated the heartbeat for the
+  caller-owned `sys_metrics` CPU% baseline. `zap_common/sys_metrics.h` dropped
+  its shared per-translation-unit `static` baseline (which two call sites or
+  racing tasks could corrupt) in favour of a caller-supplied
+  `sys_metrics_cpu_ctx_t`. `send_heartbeat` now keeps a private file-scope
+  `s_hb_cpu_ctx` (touched only by the single heartbeat task, so no lock) and
+  passes it to `sys_metrics_sample_cpu_pct(ctx, c0, c1)`.
 - **hap_dispatch (HOTFIX)** — `handle_get_devices` is now PAGED. The device
   list previously timed out for anyone with ~15+ devices: a full fleet's JSON
   exceeds one SPI frame (`HAP_MAX_PAYLOAD` = 4096; overflow confirmed at 16

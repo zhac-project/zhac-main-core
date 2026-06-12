@@ -805,7 +805,9 @@ static void handle_rule_list_req(const HapFrame& f) {
 static void handle_script_write(const HapFrame& f) {
     hap_dispatch_assert_single_task();  // F-08
     char name_raw[HAP_SCRIPT_NAME_MAX + 8] = {0};
-    static char src[HAP_SCRIPT_MAX_SRC + 1];
+    static char src[HAP_SCRIPT_MAX_SRC + 1];  // static (too big for stack) —
+        // safe to share across calls ONLY because the F-08 assert above
+        // guarantees a single dispatch task; a 2nd dispatch task would alias it.
     HapRuleExecResult result{};
     if (!hap_json_decode_script_write(f.payload, f.payload_len,
                                        name_raw, sizeof(name_raw),
@@ -1040,7 +1042,10 @@ static void handle_device_delete(const HapFrame& f) {
                 // library (no fast-path, no stale shadow attrs, no
                 // stale adapter def pointer).
                 zap_store_delete_device(ieee);
-                device_shadow_clear_attrs(ieee);
+                device_shadow_remove(ieee);   // T27: full teardown (slot +
+                                              // timers + 'a'&'c' NVS keys), not
+                                              // just clear_attrs which leaked
+                                              // the slot/timers/config blob.
                 zhac_adapter_invalidate_def_cache(ieee);
                 zhac_adapter_fallback_clear(ieee);
                 ok = zigbee_pool_remove(ieee);
@@ -1055,7 +1060,9 @@ static void handle_device_delete(const HapFrame& f) {
             // shadow / adapter cache). Still do the full sweep so the
             // UI's "hard" option is guaranteed idempotent.
             zap_store_delete_device(ieee);
-            device_shadow_clear_attrs(ieee);
+            device_shadow_remove(ieee);   // T27: idempotent — no-op if the
+                                          // slot is already gone; still erases
+                                          // any orphaned 'a'/'c' NVS keys.
             zhac_adapter_invalidate_def_cache(ieee);
             ok = true;
         }
@@ -1373,15 +1380,17 @@ void handle_metrics_req(const HapFrame& f) {
     const size_t n = metrics::prometheus_format(
         reinterpret_cast<char*>(tx_buf), sizeof(tx_buf), "zhac_p4");
 
-    HapFrame rsp = hap_make_reply(f, HapMsgType::METRICS_RSP,
-                                     HAP_FLAG_NO_ACK);
-    rsp.seq         = hap_session_next_seq();
-    rsp.payload     = tx_buf;
-    rsp.payload_len = static_cast<uint16_t>(n);
-    hap_session_send(rsp);
+    hap_send(HapMsgType::METRICS_RSP, tx_buf, static_cast<uint16_t>(n),
+             HAP_FLAG_NO_ACK, f.seq);
 }
 
 }  // namespace (P-F2 handler table + extracted lambdas)
+
+// Caller-owned CPU%-baseline window for the heartbeat cadence. Touched
+// only by send_heartbeat() (one task), so no lock needed — see
+// sys_metrics.h on ctx ownership (FINDINGS §8: the sampler no longer
+// keeps a shared per-TU static).
+static sys_metrics_cpu_ctx_t s_hb_cpu_ctx{};
 
 static void send_heartbeat() {
     uint8_t hb_buf[384];
@@ -1389,7 +1398,7 @@ static void send_heartbeat() {
     HapHeartbeat hbi{};
     hbi.uptime      = (uint32_t)(esp_timer_get_time() / 1000000UL);
     populate_mem_metrics(hbi);
-    sys_metrics_sample_cpu_pct(hbi.cpu_pct_c0, hbi.cpu_pct_c1);
+    sys_metrics_sample_cpu_pct(s_hb_cpu_ctx, hbi.cpu_pct_c0, hbi.cpu_pct_c1);
     hbi.proto_mask  = 0;
     for (uint8_t i = 0; i < device_backend_count(); i++) {
         DeviceBackend* b = device_backend_get(i);
