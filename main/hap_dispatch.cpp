@@ -1012,7 +1012,10 @@ static void handle_device_delete(const HapFrame& f) {
                 // library (no fast-path, no stale shadow attrs, no
                 // stale adapter def pointer).
                 zap_store_delete_device(ieee);
-                device_shadow_clear_attrs(ieee);
+                device_shadow_remove(ieee);   // T27: full teardown (slot +
+                                              // timers + 'a'&'c' NVS keys), not
+                                              // just clear_attrs which leaked
+                                              // the slot/timers/config blob.
                 zhac_adapter_invalidate_def_cache(ieee);
                 zhac_adapter_fallback_clear(ieee);
                 ok = zigbee_pool_remove(ieee);
@@ -1027,7 +1030,9 @@ static void handle_device_delete(const HapFrame& f) {
             // shadow / adapter cache). Still do the full sweep so the
             // UI's "hard" option is guaranteed idempotent.
             zap_store_delete_device(ieee);
-            device_shadow_clear_attrs(ieee);
+            device_shadow_remove(ieee);   // T27: idempotent — no-op if the
+                                          // slot is already gone; still erases
+                                          // any orphaned 'a'/'c' NVS keys.
             zhac_adapter_invalidate_def_cache(ieee);
             ok = true;
         }
