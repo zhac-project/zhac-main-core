@@ -9,6 +9,13 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_dispatch (P4-T28, FINDINGS §8)** — updated the heartbeat for the
+  caller-owned `sys_metrics` CPU% baseline. `zap_common/sys_metrics.h` dropped
+  its shared per-translation-unit `static` baseline (which two call sites or
+  racing tasks could corrupt) in favour of a caller-supplied
+  `sys_metrics_cpu_ctx_t`. `send_heartbeat` now keeps a private file-scope
+  `s_hb_cpu_ctx` (touched only by the single heartbeat task, so no lock) and
+  passes it to `sys_metrics_sample_cpu_pct(ctx, c0, c1)`.
 - **hap_dispatch (HOTFIX)** — `handle_get_devices` is now PAGED. The device
   list previously timed out for anyone with ~15+ devices: a full fleet's JSON
   exceeds one SPI frame (`HAP_MAX_PAYLOAD` = 4096; overflow confirmed at 16

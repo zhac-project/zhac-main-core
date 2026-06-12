@@ -1388,13 +1388,19 @@ void handle_metrics_req(const HapFrame& f) {
 
 }  // namespace (P-F2 handler table + extracted lambdas)
 
+// Caller-owned CPU%-baseline window for the heartbeat cadence. Touched
+// only by send_heartbeat() (one task), so no lock needed — see
+// sys_metrics.h on ctx ownership (FINDINGS §8: the sampler no longer
+// keeps a shared per-TU static).
+static sys_metrics_cpu_ctx_t s_hb_cpu_ctx{};
+
 static void send_heartbeat() {
     uint8_t hb_buf[384];
     uint16_t len = 0;
     HapHeartbeat hbi{};
     hbi.uptime      = (uint32_t)(esp_timer_get_time() / 1000000UL);
     populate_mem_metrics(hbi);
-    sys_metrics_sample_cpu_pct(hbi.cpu_pct_c0, hbi.cpu_pct_c1);
+    sys_metrics_sample_cpu_pct(s_hb_cpu_ctx, hbi.cpu_pct_c0, hbi.cpu_pct_c1);
     hbi.proto_mask  = 0;
     for (uint8_t i = 0; i < device_backend_count(); i++) {
         DeviceBackend* b = device_backend_get(i);
