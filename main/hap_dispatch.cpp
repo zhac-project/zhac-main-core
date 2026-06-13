@@ -372,7 +372,7 @@ static void handle_get_devices(const HapFrame& req) {
 static size_t emit_attrs_for_dev(const ZapDevice* dev, char* buf, size_t cap) {
     static ShadowAttr sa[32];
     uint8_t nsa = device_shadow_get_attrs(dev->ieee_addr, sa, 32);
-    if (nsa == 0 || cap < 2) return 0;
+    if (cap < 2) return 0;   // can't fit even "{}"; empty shadow emits "{}" below
     size_t pos = 0;
     buf[pos++] = '{';
     bool first = true;
@@ -401,7 +401,12 @@ static size_t emit_attrs_for_dev(const ZapDevice* dev, char* buf, size_t cap) {
         pos += (size_t)w;
         first = false;
     }
-    if (first) return 0;  // every attr was filtered
+    // Empty shadow (nsa==0) or every attr filtered → still close as "{}" so
+    // device_info ALWAYS carries an attrs object: the caller's splice keeps the
+    // key (well-formed envelope) and the UI renders the exposes as controls.
+    // Previously returned 0 here, which made the splice revert the whole
+    // "attrs" key, so a not-yet-reported device looked entirely stateless.
+    // (void)first — `first` is only the loop's comma guard.
     if (pos + 1 > cap) return 0;
     buf[pos++] = '}';
     return pos;
