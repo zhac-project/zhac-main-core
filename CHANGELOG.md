@@ -7,6 +7,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **hap_dispatch — unscale `VAL_FLOAT` attrs in the device-info snapshot.**
+  `emit_attrs_for_dev` printed every numeric attr with `"%ld"`, so a float stored
+  as int_val×100 (temperature 2870) showed as `2870` on the device.list /
+  device.get snapshot path. Emit `int_val/100.0` for `VAL_FLOAT`, matching the
+  live attr encoder. Pairs with the `zhac-components` VAL_FLOAT type.
+
+## [v2026061501]
+
 ### Changed
 
 - **Report the real firmware version over HAP SYNC (was hardcoded `"0.4.0"`).**
