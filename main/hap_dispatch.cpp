@@ -389,6 +389,11 @@ static size_t emit_attrs_for_dev(const ZapDevice* dev, char* buf, size_t cap) {
             snprintf(valbuf, sizeof(valbuf), "\"%s\"", esc);
         } else if (sa[i].val_type == VAL_BOOL) {
             snprintf(valbuf, sizeof(valbuf), "%s", sa[i].int_val ? "true" : "false");
+        } else if (sa[i].val_type == VAL_FLOAT) {
+            // int_val is value × 100 (2-dp) — emit as an unscaled JSON number so
+            // the device-info snapshot matches the live attr push. The previous
+            // raw "%ld" here was the "temperature shows 2900" snapshot bug.
+            snprintf(valbuf, sizeof(valbuf), "%.2f", (double)sa[i].int_val / 100.0);
         } else {
             snprintf(valbuf, sizeof(valbuf), "%ld", (long)sa[i].int_val);
         }
