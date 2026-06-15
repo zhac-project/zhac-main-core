@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "task_stacks.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"   // esp_app_get_description()->version (git-derived FW version)
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 #include "esp_task_wdt.h"
@@ -577,7 +578,8 @@ static void handle_sync(const HapFrame& f) {
     // matches the Devices page list (which filters zap_dev_is_removed).
     const uint16_t n_active = pool_count_active();
     if (hap_json_encode_sync_ack(tx_buf, sizeof(tx_buf), &len,
-                                  info.session_id, "0.4.0", n_active)) {
+                                  info.session_id,
+                                  esp_app_get_description()->version, n_active)) {
         hap_send(HapMsgType::SYNC, tx_buf, len, 0);
         ESP_LOGI(TAG, "SYNC_ACK sent — %d devices", n_active);
     }
