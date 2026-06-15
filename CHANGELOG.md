@@ -7,6 +7,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Report the real firmware version over HAP SYNC (was hardcoded `"0.4.0"`).**
+  The SYNC_ACK fw_ver now uses `esp_app_get_description()->version`, baked from
+  `git describe --tags --always --dirty` via `PROJECT_VER` in CMakeLists. S3
+  stores and shows it in the P4 Info block, so it tracks releases (e.g.
+  `v2026061501`) instead of going stale.
+
+## [v2026061302]
+
 ### Fixed
 
 - **P5 LOW-tail sweep (FINDINGS §1/§2/§3/§5)** — conservative honesty/robustness
