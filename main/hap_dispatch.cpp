@@ -368,8 +368,9 @@ static void handle_get_devices(const HapFrame& req) {
 // Emit the cached shadow attrs as a JSON object (e.g.
 // `{"state":1,"battery":85}`) for the device-info splicer. Returns the
 // number of bytes written, or 0 if no attrs survived the `_`-prefix
-// filter or the buffer would overflow. Must run on task_hap (the shared
-// `sa` scratch is task-serialised).
+// filter or the buffer would overflow. Must run on the single HAP dispatch
+// task (hap_slave_task); the shared `sa` scratch is serialised by that
+// single-task invariant (F-08).
 static size_t emit_attrs_for_dev(const ZapDevice* dev, char* buf, size_t cap) {
     static ShadowAttr sa[32];
     uint8_t nsa = device_shadow_get_attrs(dev->ieee_addr, sa, 32);
