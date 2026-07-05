@@ -4,7 +4,7 @@ ESP32-P4 firmware for [ZHAC]. Runs the Zigbee coordinator, Lua script
 engine, and rule scheduler. Communicates with the S3 network core
 over SPI via the custom HAP binary protocol.
 
-[ZHAC]: https://github.com/zhac-project/zhac-platform
+[ZHAC]: https://github.com/zhac-project/zhac-docs
 
 ## Responsibilities
 
@@ -60,8 +60,9 @@ export EMBEDDED_ZHC_PATH=$PWD/../embedded-zhc
 idf.py build
 ```
 
-When building via `zhac-platform`'s justfile, both overrides are
-exported for you automatically.
+With the sibling layout above, CMake also resolves
+`../zhac-components/components` without `IDF_COMPONENT_OVERRIDE_PATH` — the
+export just makes the override explicit.
 
 ## Flash
 
@@ -79,5 +80,5 @@ See `CONTRIBUTING.md`. All contributions require signing `CLA.md`.
 
 ## Versioning
 
-Releases tagged `vYYYYMMDDVV`. See `zhac-platform` README for the
-scheme.
+Releases tagged `vYYYYMMDDVV` (UTC date + 2-digit revision). Each repo
+tags its own version independently.
