@@ -134,7 +134,7 @@ static void arm_resume_deadline(lua_State* co) {
 typedef struct {
     esp_timer_handle_t handle;
     int                coroutine_ref;   // -1 = free
-    bool               in_use;
+    std::atomic<bool>  in_use;          // release/acquire — see on_timer_fire / slot_acquire
 } TimerSlot;
 
 static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
@@ -242,7 +242,7 @@ extern "C" void lua_scheduler_yield_bump(void) {
 // ── Timer callback → resume queue push ────────────────────────────────
 static void on_timer_fire(void* arg) {
     TimerSlot* slot = (TimerSlot*)arg;
-    if (!slot || !slot->in_use) return;
+    if (!slot || !slot->in_use.load(std::memory_order_acquire)) return;
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
     m.resume.coroutine_ref = slot->coroutine_ref;
@@ -262,7 +262,10 @@ static void on_timer_fire(void* arg) {
         // orphaning the freshly-parked coroutine. Ref-then-flag closes
         // the window (the slot isn't claimable until in_use is false).
         slot->coroutine_ref = -1;
-        slot->in_use        = false;
+        // release: publishes the coroutine_ref=-1 store above before another
+        // core can observe the slot as free (enforces the ref-then-flag order
+        // the comment above intends — plain stores let the CPU reorder them).
+        slot->in_use.store(false, std::memory_order_release);
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
@@ -282,8 +285,11 @@ static void on_timer_fire(void* arg) {
 
 static TimerSlot* slot_acquire(int coroutine_ref) {
     for (size_t i = 0; i < CONFIG_LUA_ENGINE_TIMER_POOL; ++i) {
-        if (!s_timer_pool[i].in_use) {
-            s_timer_pool[i].in_use        = true;
+        // acquire: pairs with on_timer_fire's release, so a slot seen free has
+        // its coroutine_ref already cleared — our claim below can't be clobbered
+        // by a late ref=-1 store from the releasing timer.
+        if (!s_timer_pool[i].in_use.load(std::memory_order_acquire)) {
+            s_timer_pool[i].in_use.store(true, std::memory_order_relaxed);
             s_timer_pool[i].coroutine_ref = coroutine_ref;
             if (!s_timer_pool[i].handle) {
                 const esp_timer_create_args_t args = {
@@ -294,7 +300,7 @@ static TimerSlot* slot_acquire(int coroutine_ref) {
                     .skip_unhandled_events = false,
                 };
                 if (esp_timer_create(&args, &s_timer_pool[i].handle) != ESP_OK) {
-                    s_timer_pool[i].in_use = false;
+                    s_timer_pool[i].in_use.store(false, std::memory_order_release);
                     return NULL;
                 }
             }

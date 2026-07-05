@@ -30,6 +30,7 @@
 // symbols (no extern "C"), so include them rather than re-declaring.
 #include "rule_store.h"
 #include "zap_store.h"
+#include "freertos/semphr.h"
 
 static const char* TAG = "p4_ota";
 
@@ -45,6 +46,20 @@ static uint32_t                s_ota_total           = 0;
 // begin so a fresh OTA retry can report fresh failures.
 static bool                    s_ota_failure_notified = false;
 
+// Serialises the OTA state (s_ota_handle + partition/offset/total) between the
+// dispatch task (handle_ota_chunk) and the esp_timer task (ota_idle_abort_cb).
+// Without it the idle-abort can esp_ota_abort() + zero s_ota_handle while the
+// dispatch task is mid esp_ota_write() on the same handle (REPORT.md §2.3).
+// Created lazily by handle_ota_chunk, which always runs before the idle timer
+// is ever armed, so the creation itself is single-task.
+static SemaphoreHandle_t s_ota_mutex = nullptr;
+namespace {
+struct OtaLockGuard {
+    OtaLockGuard()  { if (s_ota_mutex) xSemaphoreTake(s_ota_mutex, portMAX_DELAY); }
+    ~OtaLockGuard() { if (s_ota_mutex) xSemaphoreGive(s_ota_mutex); }
+};
+}  // namespace
+
 // ── Idle-abort watchdog (T20) ─────────────────────────────────────────
 // If S3 starts an OTA and then stops sending (link drop, S3 reboot, user
 // cancel) the open esp_ota_handle pins flash + the staging partition
@@ -59,6 +74,7 @@ static int64_t                 s_ota_last_chunk_us = 0;
 static esp_timer_handle_t      s_ota_idle_timer    = nullptr;
 
 static void ota_idle_abort_cb(void*) {
+    OtaLockGuard _ota_lk;            // serialise with the dispatch-task handler
     if (s_ota_handle == 0) return;   // already done/aborted — nothing to do
     const int64_t idle = esp_timer_get_time() - s_ota_last_chunk_us;
     if (idle < OTA_IDLE_TIMEOUT_US) {
@@ -73,11 +89,14 @@ static void ota_idle_abort_cb(void*) {
     esp_ota_abort(s_ota_handle);
     s_ota_handle = 0;
     s_ota_part = nullptr;
-    // Capture progress BEFORE zeroing so the abort status frame reports the
-    // real byte count received, not 0.
-    const uint32_t rcvd = s_ota_expected_offset;
+    // Capture progress BEFORE zeroing so the abort status frame reports the real
+    // byte count received, not 0. Zero s_ota_total too — it was left stale, so a
+    // later checkpoint query reported a bogus total (REPORT.md §2.3).
+    const uint32_t rcvd  = s_ota_expected_offset;
+    const uint32_t total = s_ota_total;
     s_ota_expected_offset = 0;
-    send_ota_status(false, rcvd, s_ota_total, "idle timeout");
+    s_ota_total           = 0;
+    send_ota_status(false, rcvd, total, "idle timeout");
 }
 
 static void ota_idle_timer_rearm() {
@@ -147,6 +166,8 @@ void handle_ota_checkpoint_req(const HapFrame& req) {
 
 // ── OTA_CHUNK handler ─────────────────────────────────────────────────────
 void handle_ota_chunk(const HapFrame& f) {
+    if (!s_ota_mutex) s_ota_mutex = xSemaphoreCreateMutex();
+    OtaLockGuard _ota_lk;            // serialise with ota_idle_abort_cb
     if (f.payload_len < HAP_OTA_CHUNK_HDR_SIZE) {
         ESP_LOGE(TAG, "OTA_CHUNK too short: %u", f.payload_len);
         return;
@@ -200,6 +221,7 @@ void handle_ota_chunk(const HapFrame& f) {
         ota_idle_timer_disarm();   // T20
         s_ota_part = nullptr;
         s_ota_expected_offset = 0;
+        s_ota_total = 0;
         send_ota_status(false, hdr->offset, hdr->total, "offset mismatch");
         return;
     }
@@ -214,7 +236,7 @@ void handle_ota_chunk(const HapFrame& f) {
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             esp_ota_abort(s_ota_handle);
             ota_idle_timer_disarm();   // T20
-            s_ota_handle = 0; s_ota_part = nullptr; s_ota_expected_offset = 0;
+            s_ota_handle = 0; s_ota_part = nullptr; s_ota_expected_offset = 0; s_ota_total = 0;
             send_ota_status(false, hdr->offset, hdr->total, esp_err_to_name(err));
             return;
         }

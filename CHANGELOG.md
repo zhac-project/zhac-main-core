@@ -9,6 +9,25 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_slave — close the `s_cb` boot-window torn read (REPORT.md §2.3).** The
+  dispatch callback (`std::function`) was assigned from task_hap while the prio-7
+  slave task was already running and reading it. Reads now gate on a
+  release/acquire `s_cb_ready` atomic, so a reader only touches `s_cb` once the
+  setter has fully published it.
+- **lua_engine — atomic TimerSlot handoff (REPORT.md §2.3).** `TimerSlot::in_use`
+  was a plain `bool`; the documented "clear ref before releasing in_use" order
+  was unenforced, so a cross-core reorder could clobber a freshly-claimed slot's
+  coroutine ref. `in_use` is now `std::atomic<bool>` (release on free / acquire
+  on claim).
+- **p4_ota — serialise idle-abort vs in-flight writes (REPORT.md §2.3).** The
+  esp_timer idle-abort callback could `esp_ota_abort()` + zero the handle while
+  the dispatch task was mid `esp_ota_write()` on it. A mutex now serialises the
+  handler and the callback; the abort paths also zero `s_ota_total` (was left
+  stale, so a later checkpoint reported a bogus total).
+- **hap_dispatch — LOW_BATTERY alert hysteresis (REPORT.md §2.3).** A device that
+  kept reporting a low battery re-fired an ALERT on every report. Latch per IEEE:
+  alert only on a downward crossing below the threshold, re-arm on recovery (+
+  margin).
 - **hap_dispatch — unscale `VAL_FLOAT` attrs in the device-info snapshot.**
   `emit_attrs_for_dev` printed every numeric attr with `"%ld"`, so a float stored
   as int_val×100 (temperature 2870) showed as `2870` on the device.list /

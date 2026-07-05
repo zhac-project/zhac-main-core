@@ -42,9 +42,16 @@
 #include <cstring>
 #include <cstdlib>
 
+#include <atomic>
+
 static const char* TAG = "hap_slave";
 
 static HapFrameCallback s_cb;
+// Set once from task_hap AFTER the slave task is already running (boot-window
+// race, REPORT.md §2.3). A std::function can't be assigned atomically, so gate
+// reads on this release/acquire flag: a reader only touches s_cb once the setter
+// has fully published it. Assumes single registration (the actual usage).
+static std::atomic<bool> s_cb_ready{false};
 
 // Pin assignments — P4 SPI slave (per docs/esp32_p4_gpio_allocation.md §1).
 static constexpr gpio_num_t PIN_SCLK = GPIO_NUM_18;
@@ -194,7 +201,7 @@ static void hap_slave_task(void*) {
                     // because the P4 HAP dispatcher is single-task — F-08 — and
                     // consumes synchronously.)
                     peer.payload = s_rx_buf;
-                    if (s_cb) s_cb(peer);
+                    if (s_cb_ready.load(std::memory_order_acquire) && s_cb) s_cb(peer);
                 } else {
                     _METRIC_COUNTER_INC(METRIC_HAP_CRC_ERRORS, 1);
                     // CRC failed — don't dispatch this frame. Skip the
@@ -213,7 +220,7 @@ static void hap_slave_task(void*) {
             && peer.payload_len == 0
             && peer.type != static_cast<HapMsgType>(0)) {
             peer.payload = nullptr;
-            if (s_cb) s_cb(peer);
+            if (s_cb_ready.load(std::memory_order_acquire) && s_cb) s_cb(peer);
         }
         skip_zero_payload_dispatch:;
 
@@ -336,4 +343,7 @@ void hap_slave_send(const HapFrame& frame) {
 
 void hap_slave_set_callback(HapFrameCallback cb) {
     s_cb = std::move(cb);
+    // release: pairs with the acquire in the dispatch loop so a reader that sees
+    // ready==true observes the fully-constructed s_cb (no torn read).
+    s_cb_ready.store(true, std::memory_order_release);
 }

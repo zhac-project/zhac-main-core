@@ -146,6 +146,35 @@ static auto hap_tx_scratch() -> uint8_t (&)[HAP_MAX_PAYLOAD] {
 void send_alert(HapAlertCode code, uint64_t ieee, const char* msg);
 
 // Encode + send one queued attr-update — called only from TaskHAP.
+// LOW_BATTERY hysteresis (REPORT.md §2.3). A device that keeps reporting a low
+// battery would otherwise re-fire an ALERT on every report. Latch per IEEE:
+// alert only on a fresh downward crossing below the threshold, and re-arm once
+// the device reports back above it (+ a small margin). Runs on TaskHAP only
+// (see emit_attr_update's caller), so the table needs no lock.
+static bool battery_low_should_alert(uint64_t ieee, int pct) {
+    static constexpr int kClearPct = BATTERY_LOW_THRESHOLD_PCT + 5;   // hysteresis band
+    struct BattLatch { uint64_t ieee; bool below; };
+    static BattLatch s_latch[24];
+    static uint8_t   s_n = 0;
+
+    BattLatch* e = nullptr;
+    for (uint8_t i = 0; i < s_n; i++) if (s_latch[i].ieee == ieee) { e = &s_latch[i]; break; }
+
+    if (pct >= kClearPct)                 { if (e) e->below = false; return false; }  // recovered
+    if (pct >= BATTERY_LOW_THRESHOLD_PCT) { return false; }                           // in band
+    // pct < threshold: alert only on the first crossing.
+    if (!e) {
+        if (s_n < sizeof(s_latch) / sizeof(s_latch[0])) {
+            e = &s_latch[s_n++]; e->ieee = ieee; e->below = false;
+        } else {
+            return true;   // table full (rare) — fail open and alert
+        }
+    }
+    if (e->below) return false;   // already alerted while still low
+    e->below = true;
+    return true;
+}
+
 static void emit_attr_update(const ZclAttrEvent& ze) {
     if (ze.key[0] == '_') return;  // synthetic internal attr (e.g. "_last_seen")
 
@@ -176,8 +205,9 @@ static void emit_attr_update(const ZclAttrEvent& ze) {
     // Trigger LOW_BATTERY alert when battery drops below 20% — ZCL
     // cluster 0x0001 attr 0x0021 is scaled to 0–100. Stays in TaskHAP
     // context (send_alert ultimately calls hap_send).
-    if (ze.cluster == 0x0001 && ze.attr_id == 0x0021 && ze.val_type == VAL_INT) {
-        if (ze.int_val < BATTERY_LOW_THRESHOLD_PCT && ze.int_val >= 0) {
+    if (ze.cluster == 0x0001 && ze.attr_id == 0x0021 && ze.val_type == VAL_INT &&
+        ze.int_val >= 0) {
+        if (battery_low_should_alert(ze.ieee, (int)ze.int_val)) {
             char msg[64];
             snprintf(msg, sizeof(msg), "battery %d%% on device", (int)ze.int_val);
             send_alert(HapAlertCode::LOW_BATTERY, ze.ieee, msg);
