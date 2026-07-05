@@ -496,10 +496,6 @@ static bool ezsp_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t 
     return true;
 }
 
-static bool ezsp_read_attr(uint64_t /*ieee*/, uint8_t /*ep*/, const char* /*key*/) {
-    return false;  // TODO
-}
-
 static bool ezsp_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out) {
     uint16_t n = pool_count();
     if (n > max) n = max;
@@ -545,7 +541,9 @@ static DeviceBackend s_ezsp_backend = {
     .stop_discovery  = ezsp_stop_discovery,
     .interview       = ezsp_interview,
     .write_attr      = ezsp_write_attr,
-    .read_attr       = ezsp_read_attr,
+    // .read_attr — unimplemented: no on-demand attribute-read path exists (no
+    // caller invokes DeviceBackend::read_attr). nullptr, matching zigbee_backend.
+    .read_attr       = nullptr,
     .get_device_list = ezsp_get_device_list,
     .get_device      = ezsp_get_device,
     .remove_device   = ezsp_remove_device,

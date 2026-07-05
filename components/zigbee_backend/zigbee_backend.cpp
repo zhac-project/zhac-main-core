@@ -86,11 +86,6 @@ static bool zb_write_attr(uint64_t ieee, uint8_t ep, const char* key, int32_t va
     return false;
 }
 
-static bool zb_read_attr(uint64_t /*ieee*/, uint8_t /*ep*/, const char* /*key*/) {
-    // TODO: implement ZCL read attribute
-    return false;
-}
-
 static bool zb_get_device_list(ZapDevice* out, uint16_t max, uint16_t* count_out) {
     // Hold the pool lock across count + memcpy so interview/remove can't
     // swap-with-last under us mid-copy.
@@ -154,7 +149,9 @@ static DeviceBackend s_zigbee_backend = {
     .stop_discovery = zb_stop_discovery,
     .interview      = zb_interview,
     .write_attr     = zb_write_attr,
-    .read_attr      = zb_read_attr,
+    // .read_attr — unimplemented: no on-demand attribute-read path exists (no
+    // caller invokes DeviceBackend::read_attr). nullptr, like .poll above.
+    .read_attr      = nullptr,
     .get_device_list = zb_get_device_list,
     .get_device     = zb_get_device,
     .remove_device  = zb_remove_device,

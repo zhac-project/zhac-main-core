@@ -55,7 +55,7 @@ bool           ezsp_backend_register();   // device_backend_register(instance())
 | `stop_discovery`  | `EZSP_PERMIT_JOINING` with duration=0 |
 | `interview`       | TODO — currently returns false |
 | `write_attr`      | `EZSP_SEND_UNICAST` with built-in mappings for `state`/`brightness`/`color_temp` |
-| `read_attr`       | TODO — returns false |
+| `read_attr`       | not wired — `nullptr` in vtable (no on-demand read path / caller) |
 | `get_device_list` | `pool_lock` + memcpy snapshot (shared with ZNP) |
 | `get_device`      | `pool_find_by_ieee` |
 | `remove_device`   | `EZSP_LEAVE_NETWORK` request + pool remove + `zap_store_delete_device` |
@@ -108,7 +108,7 @@ firmware emits in its `EZSP_CB_MESSAGE_SENT` callback.
 | EZSP version mismatch | log E, abort init |
 | `interview` invoked | returns false (TODO) |
 | Driver-level NAK / retransmit | **not yet implemented** — frames may be dropped under load (ZB-F1) |
-| `read_attr` invoked | returns false |
+| `read_attr` | `nullptr` in vtable — never invoked (no caller) |
 
 ## Threading
 
