@@ -1529,6 +1529,13 @@ void task_hap(void*) {
     event_bus_subscribe(EventType::DEVICE_JOIN,  on_device_event_for_hap);
     event_bus_subscribe(EventType::DEVICE_LEAVE, on_device_leave_for_hap);
     event_bus_subscribe(EventType::ZCL_ATTR,     on_zcl_attr_for_hap);
+    // Optimistic (command-driven, unconfirmed) shadow changes ride the same
+    // forwarder → BULK_STATE_UPDATE → S3 gateway → local webui + cloud. It
+    // reuses the ZclAttrEvent payload, so on_zcl_attr_for_hap handles it as-is.
+    // The rule engine subscribes to ZCL_ATTR only, so it never fires on an
+    // optimistic value. Fixes no-report devices (Tuya LED drivers) never
+    // reflecting a command past the P4 cache in the cloud UI.
+    event_bus_subscribe(EventType::SHADOW_OPTIMISTIC, on_zcl_attr_for_hap);
 
     // Send initial heartbeat to wake S3
     send_heartbeat();

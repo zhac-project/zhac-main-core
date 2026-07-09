@@ -9,6 +9,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **hap_dispatch — forward optimistic shadow changes to the S3 gateway + cloud.**
+  Subscribed the HAP attribute forwarder (`on_zcl_attr_for_hap`) to the new
+  `EventType::SHADOW_OPTIMISTIC` in addition to `ZCL_ATTR`, so a command-driven
+  optimistic state change on a no-report device (Tuya LED driver) rides the same
+  `BULK_STATE_UPDATE` path to the local webui and cloud. Previously it stopped at
+  the P4 cache — the cloud webUI never reflected an rgbcct toggle while a
+  self-reporting socket updated fine. The rule engine still subscribes to
+  `ZCL_ATTR` only, so it never fires on the unconfirmed value. Emit lives in
+  `device_shadow` (zhac-components). **HW-test-pending** (reflash + on-device
+  cloud check).
 - **hap_slave — close the `s_cb` boot-window torn read (REPORT.md §2.3).** The
   dispatch callback (`std::function`) was assigned from task_hap while the prio-7
   slave task was already running and reading it. Reads now gate on a
