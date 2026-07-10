@@ -9,7 +9,18 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
-- **hap_dispatch — forward optimistic shadow changes to the S3 gateway + cloud.**
+- **lua_engine — panic recovery no longer leaks coroutine refs (CODEX M-03).**
+  The scheduler wraps each dispatch step in a `setjmp` frame; an unprotected Lua
+  panic `longjmp`s back and the loop drops the message. If the panic fired after
+  a coroutine was created (registry ref + live-count taken) but before
+  `resume_and_settle`'s `luaL_unref` + `lua_scheduler_coroutine_exit`, both
+  leaked — repeated OOM/internal raises would eventually exhaust
+  `CONFIG_LUA_ENGINE_MAX_COROUTINES`. A POD `s_inflight {ref, counted}` now
+  tracks the in-flight coroutine (set at spawn/resume, cleared on settle) and the
+  loop's panic branch reclaims it. Also corrected the misleading
+  `lua_engine_dispatch` docs — it is an intentional no-op C entry point with no
+  in-tree callers (the C++ EventBus bridge does the real dispatch), not a
+  resume-enqueue.
   Subscribed the HAP attribute forwarder (`on_zcl_attr_for_hap`) to the new
   `EventType::SHADOW_OPTIMISTIC` in addition to `ZCL_ATTR`, so a command-driven
   optimistic state change on a no-report device (Tuya LED driver) rides the same

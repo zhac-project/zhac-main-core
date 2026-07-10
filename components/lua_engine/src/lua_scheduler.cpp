@@ -69,6 +69,16 @@ static const char* TAG = "lua_sched";
 static std::jmp_buf s_panic_jmp;
 static volatile bool s_panic_armed = false;
 
+// CODEX M-03: a coroutine that has been created (registry ref taken + live-count
+// incremented) but not yet settled by resume_and_settle(). A lua panic longjmps
+// straight to the loop's setjmp frame — past the normal luaL_unref +
+// lua_scheduler_coroutine_exit — so without this the registry anchor and the
+// live-count slot leak; repeated OOM/internal raises would eventually exhaust
+// CONFIG_LUA_ENGINE_MAX_COROUTINES. TaskLua is single-threaded, so at most one
+// coroutine is in flight at a time. POD — longjmp bypasses C++ destructors.
+struct InFlightCo { int ref = LUA_NOREF; bool counted = false; };
+static InFlightCo s_inflight;
+
 static int lua_panic_handler(lua_State* L) {
     const char* msg = lua_tostring(L, -1);
     ESP_LOGE(TAG, "lua panic (unprotected error) — abandoning dispatch step: %s",
@@ -441,6 +451,7 @@ static void resume_and_settle(lua_State* L, lua_State* co, int ref,
         // ours is redundant — dropping it is what keeps the registry
         // at one slot per suspended coroutine.
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        s_inflight = {};   // CODEX M-03: settled — count now owned by the timer slot
         return;
     }
     if (status != LUA_OK) {
@@ -451,6 +462,7 @@ static void resume_and_settle(lua_State* L, lua_State* co, int ref,
     lua_pop(co, (status == LUA_OK) ? nres : 1);
     luaL_unref(L, LUA_REGISTRYINDEX, ref);
     lua_scheduler_coroutine_exit();
+    s_inflight = {};   // CODEX M-03: settled
 }
 
 // Spawns a coroutine from the function on top of L's stack (consumed)
@@ -465,16 +477,22 @@ static lua_State* spawn_coroutine(lua_State* L, int* out_ref) {
     *out_ref = luaL_ref(L, LUA_REGISTRYINDEX);   // consumes co
     if (*out_ref == LUA_NOREF) return NULL;
     lua_scheduler_coroutine_enter();
+    s_inflight = { *out_ref, true };   // CODEX M-03: owed until resume_and_settle
     return co;
 }
 
 static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
+    // CODEX M-03: this coroutine (ref taken + counted at spawn) is now in
+    // flight — resume_and_settle owes its unref + exit. Track it so a panic in
+    // the rawgeti / arg-push / resume below reclaims it instead of leaking.
+    s_inflight = { r->coroutine_ref, true };
     lua_rawgeti(L, LUA_REGISTRYINDEX, r->coroutine_ref);
     lua_State* co = lua_tothread(L, -1);
     lua_pop(L, 1);
     if (!co) {
         ESP_LOGW(TAG, "resume: ref %d is not a thread", r->coroutine_ref);
         luaL_unref(L, LUA_REGISTRYINDEX, r->coroutine_ref);
+        s_inflight = {};
         return;
     }
 
@@ -796,9 +814,16 @@ static void task_lua(void* arg) {
         if (setjmp(s_panic_jmp) != 0) {
             // Returned from a panic longjmp — step already logged/counted.
             s_panic_armed = false;
+            // CODEX M-03: the longjmp skipped resume_and_settle. Reclaim any
+            // coroutine still in flight so its registry ref + live-count slot
+            // don't leak (a repeated raise would otherwise exhaust the pool).
+            if (s_inflight.ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, s_inflight.ref);
+            if (s_inflight.counted)          lua_scheduler_coroutine_exit();
+            s_inflight = {};
             continue;
         }
         s_panic_armed = true;
+        s_inflight = {};   // CODEX M-03: clean slate for this dispatch step
 
         if (m.kind == MSG_RESUME) {
             resume_coroutine(L, &m.resume);

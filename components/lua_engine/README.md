@@ -47,7 +47,7 @@ the VM. All call paths into Lua go through `s_resume_q` —
 |---|---|
 | `bool lua_engine_init()` | Brings up custom allocator, sandbox, native modules, `TaskLua`. Idempotent. **Must** be called after `nvs_flash_init`. |
 | `void lua_engine_load_all()` | Scan `/spiffs/scripts/*.lua` and spawn a top-level coroutine per file. Registrations (`on_attr_change`, `on_mqtt`, `on_cron`, `on_boot`) are recorded so subsequent EventBus events can dispatch into them. |
-| `void lua_engine_dispatch(const Event*)` | Enqueue a resume for any coroutine subscribed to `event`. Non-blocking; called from EventBus subscribers. |
+| `void lua_engine_dispatch(const Event*)` | **No-op C-callable stub — no in-tree callers.** Real event→coroutine dispatch is done by the C++ EventBus bridge (`lua_engine_event_bridge.cpp`), which subscribes to `ATTR_CHANGE`/`MQTT_MSG`/`CTRL_BOOT`/`ZCL_RAW` directly. Kept only as a stable C entry point. |
 | `size_t lua_engine_heap_used_bytes()` / `_peak_bytes()` | Live + high-water allocator counters (charged to `kBudgetBytes`). |
 | `uint16_t lua_engine_live_coroutines()` | Currently registered coroutine refs. |
 | `uint32_t lua_engine_error_count()` / `_yield_count()` | Lifetime counters. |

@@ -93,9 +93,10 @@ void lua_engine_load_all(void) {
 
 // EventBus → Lua dispatcher. The full struct layouts for Event /
 // ZclAttrEvent / MqttMsgEvent are C++-only (they use <cstdint>), so
-// the wiring lives in `lua_engine_event_bridge.cpp`. This function
-// stays as a C-callable entry point for the initial boot event
-// published from main.cpp at startup.
+// the wiring lives in `lua_engine_event_bridge.cpp` (which subscribes to
+// the EventBus directly). This stays as a stable C-callable entry point but
+// has NO in-tree callers today (CODEX I-03 smell): it is intentionally a
+// no-op, not dead-by-accident. Remove only once the C ABI need is gone.
 //
 // `ev` is treated opaquely — its type byte lives at offset 0 and
 // the 96-byte data blob starts at offset 8 (aligned as the
