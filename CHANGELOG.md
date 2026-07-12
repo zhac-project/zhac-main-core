@@ -9,6 +9,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **event bus — drain every event type, not a hand-maintained 1..10 list.**
+  `task_event_bus` drained a fixed `ALL_TYPES` list that predated
+  `EventType::SHADOW_OPTIMISTIC` (= 11), so those events were published but never
+  delivered: the type-11 subscriber queue filled and dropped forever
+  (`event_bus: queue full type=11 sub=0 — oldest overwritten`), optimistic shadow
+  updates never reached the HAP forwarder / S3, and the constant publish→evict
+  churn under a fast-firing rule disturbed the HAP link. The drain range is now
+  derived from the enum (`1 .. _COUNT-1`), so any newly-added event type is
+  serviced automatically. Regression from the SHADOW_OPTIMISTIC work
+  (components `0b5f6d3`).
 - **lua_engine — panic recovery no longer leaks coroutine refs (CODEX M-03).**
   The scheduler wraps each dispatch step in a `setjmp` frame; an unprotected Lua
   panic `longjmp`s back and the loop drops the message. If the panic fired after
