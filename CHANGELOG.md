@@ -9,6 +9,17 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **BIND_REQ with no target now binds to the coordinator instead of nowhere.**
+  A `device.bind` without `dst_ieee` (what the SPA Bind form has always sent)
+  passed `0` straight into the ZDO_BIND_REQ as an addr-mode-IEEE target of
+  `0x0000000000000000` — a binding to a nonexistent address, so the Bind tab
+  never produced a working binding. `handle_bind_req` now substitutes the
+  coordinator's own IEEE + endpoint 1 (the reporting default, mirroring the
+  auto-configure path in `zhc_configure_bridge`); if the coordinator IEEE is
+  not yet known the request fails cleanly via BIND_ACK instead of emitting a
+  garbage ZDO frame. Explicit `dst_ieee`/`dst_ep` (device→device bindings,
+  now settable from the SPA's new Target picker) pass through unchanged.
+
 - **event bus — drain every event type, not a hand-maintained 1..10 list.**
   `task_event_bus` drained a fixed `ALL_TYPES` list that predated
   `EventType::SHADOW_OPTIMISTIC` (= 11), so those events were published but never

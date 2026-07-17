@@ -1036,19 +1036,34 @@ static void handle_bind_req(const HapFrame& f) {
     uint16_t tx_len = 0;
     bool ok = false;
     if (hap_json_decode_bind_req(f.payload, f.payload_len, req)) {
-        // F6/F35: copy nwk out under the pool lock; the ZDO round-trips
-        // below must not consume an unlocked pool pointer.
-        uint16_t src_nwk = 0xFFFE;
-        zigbee_pool_lock();
-        if (const ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee))
-            src_nwk = src_dev->nwk_addr;
-        zigbee_pool_unlock();
-        if (req.unbind)
-            ok = zigbee_zdo_unbind(src_nwk, req.src_ieee, req.src_ep,
-                                   req.cluster, req.dst_ieee, req.dst_ep);
-        else
-            ok = zigbee_zdo_bind(src_nwk, req.src_ieee, req.src_ep,
-                                 req.cluster, req.dst_ieee, req.dst_ep);
+        // No target given (dst_ieee absent/0) ⇒ bind to the COORDINATOR, the
+        // reporting default — mirroring the auto-configure path
+        // (zhc_configure_bridge: coordinator ieee + ep 1). Previously the 0
+        // went straight into the ZDO frame as addr_mode=IEEE target
+        // 0x0000000000000000 — a bind to nowhere, so the SPA Bind form
+        // (which sends no dst) never produced a working binding.
+        if (req.dst_ieee == 0) {
+            req.dst_ieee = zigbee_mgr_coordinator_ieee();
+            req.dst_ep   = 1;
+        }
+        if (req.dst_ieee == 0) {
+            // ok stays false → BIND_ACK carries the failure to the caller.
+            ESP_LOGW(TAG, "bind_req: no target and coordinator ieee not yet known");
+        } else {
+            // F6/F35: copy nwk out under the pool lock; the ZDO round-trips
+            // below must not consume an unlocked pool pointer.
+            uint16_t src_nwk = 0xFFFE;
+            zigbee_pool_lock();
+            if (const ZapDevice* src_dev = pool_find_by_ieee(req.src_ieee))
+                src_nwk = src_dev->nwk_addr;
+            zigbee_pool_unlock();
+            if (req.unbind)
+                ok = zigbee_zdo_unbind(src_nwk, req.src_ieee, req.src_ep,
+                                       req.cluster, req.dst_ieee, req.dst_ep);
+            else
+                ok = zigbee_zdo_bind(src_nwk, req.src_ieee, req.src_ep,
+                                     req.cluster, req.dst_ieee, req.dst_ep);
+        }
     }
     if (hap_json_encode_bind_ack(tx_buf, sizeof(tx_buf), &tx_len, ok)) {
         hap_send(HapMsgType::BIND_ACK, tx_buf, tx_len, HAP_FLAG_NO_ACK, f.seq);
