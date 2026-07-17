@@ -558,6 +558,20 @@ static void handle_set_attribute(const HapFrame& req) {
                     ok = zigbee_zcl_level(dev_snap.nwk_addr, ep, level, 0);
                 } else if (cluster == 0x0300) {
                     ok = zigbee_zcl_color_temp(dev_snap.nwk_addr, ep, (uint16_t)(attr.val & 0xFFFF), 0);
+                } else if (cluster == 0x0004) {
+                    // Native ZCL Groups membership (for hardware zone-remotes,
+                    // e.g. MiBoxer FUT089Z zones 101-108). key = group_add /
+                    // group_remove; val = group id (0 = reserved "all", invalid
+                    // as a membership).
+                    uint16_t gid = (uint16_t)(attr.val & 0xFFFF);
+                    if (gid == 0) {
+                        ESP_LOGW(TAG, "group set: gid 0 invalid (ieee=0x%llx)",
+                                 (unsigned long long)attr.ieee);
+                    } else if (strcmp(key, "group_remove") == 0) {
+                        ok = zigbee_zcl_group_remove(dev_snap.nwk_addr, ep, gid);
+                    } else {   // group_add (default)
+                        ok = zigbee_zcl_group_add(dev_snap.nwk_addr, ep, gid);
+                    }
                 } else {
                     ESP_LOGW(TAG, "SET_ATTR unhandled cluster=0x%04x key=%s ieee=0x%llx",
                              cluster, key, (unsigned long long)attr.ieee);

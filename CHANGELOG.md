@@ -7,6 +7,16 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **SET_ATTRIBUTE cluster 0x0004 → native ZCL group membership.**
+  `handle_set_attribute` now routes a set with `cluster=0x0004` +
+  `key=group_add`/`group_remove` + `val=group_id` to
+  `zigbee_zcl_group_add`/`_remove`, joining/leaving a device's ZCL group so it
+  obeys a hardware zone-remote's groupcasts (MiBoxer FUT089Z zones = groups
+  101-108). Reuses the SET_ATTRIBUTE→SET_ACK roundtrip — no new HAP message
+  type. Part A of `extra/docs/NATIVE_ZCL_GROUPS_DESIGN.md`. HW-test-pending.
+
 ### Fixed
 
 - **BIND_REQ with no target now binds to the coordinator instead of nowhere.**
