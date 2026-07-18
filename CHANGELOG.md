@@ -9,6 +9,13 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Added
 
+- **GROUP_MEMBER_QUERY handler — read a device's ZCL group membership (inc 2b).**
+  `handle_group_member_query` decodes `{ieee, ep}`, calls
+  `zigbee_zcl_get_group_membership` (blocks up to 5 s for the device's Get Group
+  Membership Response — fine in `hap_slave_task`), and replies GROUP_MEMBER_LIST
+  `{ok, gids:[...]}`. Backs the S3 `device.groups.refresh` (authoritative
+  membership readback).
+
 - **Collection command fan-out via SET_ATTRIBUTE command-mode.**
   `handle_set_attribute` now honors a raw ZCL command: with the reserved key
   `__zclcmd__`, cluster 0x0006 sends On/Off/Toggle (`attr.attr` = the ZCL cmd id)
