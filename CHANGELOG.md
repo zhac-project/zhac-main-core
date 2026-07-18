@@ -9,6 +9,14 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Added
 
+- **Collection command fan-out via SET_ATTRIBUTE command-mode.**
+  `handle_set_attribute` now honors a raw ZCL command: with the reserved key
+  `__zclcmd__`, cluster 0x0006 sends On/Off/Toggle (`attr.attr` = the ZCL cmd id)
+  and cluster 0x0003 sends Identify, instead of deriving on/off from the value.
+  Fixes the Collections page command buttons (On/Off/Toggle/Identify), which
+  previously all sent Off. Normal attribute sets (`device.attr.set`) are
+  unchanged. HW-test-pending.
+
 - **SET_ATTRIBUTE cluster 0x0004 → native ZCL group membership.**
   `handle_set_attribute` now routes a set with `cluster=0x0004` +
   `key=group_add`/`group_remove` + `val=group_id` to

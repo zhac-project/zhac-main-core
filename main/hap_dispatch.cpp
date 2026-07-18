@@ -551,7 +551,13 @@ static void handle_set_attribute(const HapFrame& req) {
                              strcmp(key, "saturation") == 0)  cluster = 0x0300;
                 }
                 if (cluster == 0x0006) {
-                    uint8_t zcl_cmd = (attr.val != 0) ? 0x01 : 0x00;
+                    // "__zclcmd__" (collection command fan-out, api_group_cmd)
+                    // carries the raw ZCL command in attr.attr — On 0x01 / Off
+                    // 0x00 / Toggle 0x02. A normal attribute set derives on/off
+                    // from the value instead.
+                    uint8_t zcl_cmd = (strcmp(key, "__zclcmd__") == 0)
+                                          ? (uint8_t)(attr.attr & 0xFF)
+                                          : (attr.val != 0 ? 0x01 : 0x00);
                     ok = zigbee_zcl_on_off(dev_snap.nwk_addr, ep, zcl_cmd);
                 } else if (cluster == 0x0008) {
                     uint8_t level = (uint8_t)(attr.val & 0xFF);
@@ -572,6 +578,9 @@ static void handle_set_attribute(const HapFrame& req) {
                     } else {   // group_add (default)
                         ok = zigbee_zcl_group_add(dev_snap.nwk_addr, ep, gid);
                     }
+                } else if (cluster == 0x0003 && strcmp(key, "__zclcmd__") == 0) {
+                    // Collection Identify command — members blink/beep for 5 s.
+                    ok = zigbee_zcl_identify(dev_snap.nwk_addr, ep, 5);
                 } else {
                     ESP_LOGW(TAG, "SET_ATTR unhandled cluster=0x%04x key=%s ieee=0x%llx",
                              cluster, key, (unsigned long long)attr.ieee);
