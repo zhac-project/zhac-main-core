@@ -1093,6 +1093,31 @@ static void handle_bind_req(const HapFrame& f) {
     }
 }
 
+// Native-groups inc 2b: read a device's actual ZCL group membership and reply
+// with the gid list. Blocks in zigbee_zcl_get_group_membership up to 5 s for the
+// device response (dispatcher runs in hap_slave_task, so this is fine).
+static void handle_group_member_query(const HapFrame& f) {
+    uint64_t ieee = 0; uint8_t ep = 1;
+    hap_json_decode_group_query(f.payload, f.payload_len, &ieee, &ep);
+    if (ep == 0) ep = 1;
+    uint16_t nwk = 0xFFFE;
+    zigbee_pool_lock();
+    if (const ZapDevice* d = pool_find_by_ieee(ieee)) nwk = d->nwk_addr;
+    zigbee_pool_unlock();
+    uint16_t gids[16]; uint8_t count = 0;
+    bool ok = (nwk != 0xFFFE) &&
+              zigbee_zcl_get_group_membership(nwk, ep, gids, 16, &count);
+    auto& tx = hap_tx_scratch();
+    char* buf = reinterpret_cast<char*>(&tx[0]);
+    const size_t cap = sizeof(tx);
+    int n = snprintf(buf, cap, "{\"ok\":%s,\"gids\":[", ok ? "true" : "false");
+    for (uint8_t i = 0; i < count && n > 0 && (size_t)n < cap; i++)
+        n += snprintf(buf + n, cap - (size_t)n, "%s%u", i ? "," : "", gids[i]);
+    if (n > 0 && (size_t)n < cap) n += snprintf(buf + n, cap - (size_t)n, "]}");
+    if (n > 0 && (size_t)n < cap)
+        hap_send(HapMsgType::GROUP_MEMBER_LIST, tx, (uint16_t)n, HAP_FLAG_NEEDS_ACK, f.seq);
+}
+
 static void handle_device_delete(const HapFrame& f) {
     uint64_t ieee = 0;
     bool hard = false;
@@ -1409,6 +1434,7 @@ constexpr HapRow kHapHandlers[] = {
     { HapMsgType::GET_DEVICES,          handle_get_devices           },
     { HapMsgType::GET_DEVICE_BY_ID,     handle_get_device_by_id      },
     { HapMsgType::SET_ATTRIBUTE,        handle_set_attribute         },
+    { HapMsgType::GROUP_MEMBER_QUERY,   handle_group_member_query    },
     { HapMsgType::HEARTBEAT,            handle_heartbeat             },
     { HapMsgType::RULE_CREATE,          handle_rule_create           },
     { HapMsgType::RULE_DELETE,          handle_rule_delete           },
