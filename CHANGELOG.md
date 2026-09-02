@@ -7,6 +7,17 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lua event handlers never fired.** `app_main` called `lua_engine_init()` —
+  which subscribes the `on_attr_change` / `on_mqtt` / `on_boot` / `on_zcl_raw`
+  bridges — *before* `event_bus_init()`, which zeroes the subscriber table. The
+  early subscribes appeared to succeed and were then erased, so no Lua event
+  handler ran on this core since the May reorder (four queues also leaked per
+  boot). `event_bus_init()` now runs first; the bus itself refuses a subscribe
+  before init. Needs the two-minute hardware check: an `on_attr_change` script
+  must fire on a device report. (Review 2026-09, MC-01.)
+
 ### Added
 
 - **GROUP_MEMBER_QUERY handler — read a device's ZCL group membership (inc 2b).**

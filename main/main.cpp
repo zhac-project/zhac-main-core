@@ -129,12 +129,20 @@ extern "C" void app_main() {
     // load_all() therefore runs at the very end of app_main once every
     // subsystem the script may touch is up. Until then TaskLua is idle
     // waiting on its resume queue.
+    //
+    // The event bus MUST be up before the Lua engine: lua_engine_init()
+    // subscribes the on_attr_change / on_mqtt / on_boot / on_zcl_raw bridges,
+    // and event_bus_init() zeroes the subscriber table. Review 2026-09 (MC-01)
+    // found them the other way round since May: the early subscribes
+    // "succeeded" (the bus lock tolerates its not-yet-created mutex) and were
+    // then wiped, so no Lua event handler ever fired on this core.
+    // event_bus_subscribe() now also refuses to run before init.
+    event_bus_init();
     const bool lua_ready = lua_engine_init();
 
     s_log_queue = xQueueCreate(LOG_QUEUE_DEPTH, sizeof(LogEntry));
     configASSERT(s_log_queue);
 
-    event_bus_init();
     zap_store_init();
     // Writeback cache: snapshot callback + 1 s tick flush task.
     // Install before any mark_dirty consumer starts (zigbee_mgr_init later
