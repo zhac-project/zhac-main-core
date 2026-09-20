@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "device_cmd.h"
 #include "task_stacks.h"
 #include "esp_system.h"
 #include "esp_app_desc.h"   // esp_app_get_description()->version (git-derived FW version)
@@ -496,44 +497,25 @@ static void handle_set_attribute(const HapFrame& req) {
     // Route command: try protocol-agnostic backend dispatch first, then Zigbee-specific fallback
     bool ok = false;
     bool sent = false;
+    bool via_service = false;   // device_cmd did the write AND the shadow mirror
     auto& tx_buf = hap_tx_scratch();
     uint16_t len = 0;
     {
         const char* key = (attr.key[0] != '\0') ? attr.key : "state";
 
-        if (attr.sval[0]) {
-            // A string value — an enum option such as "restore". Only the
-            // converter's lookup knows its raw encoding, so hand it over as
-            // text. (An older S3 never sends sval; its enum writes still go
-            // through `val` below, as before.)
-            ZapDevice dev_snap;
-            if (zigbee_pool_snapshot(attr.ieee, &dev_snap) && dev_snap.model_id[0]) {
-                const uint8_t ep = (attr.ep != 0) ? attr.ep
-                                   : (dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
-                ok = zhac_adapter_send_string(attr.ieee, dev_snap.model_id,
-                                              dev_snap.manufacturer_name,
-                                              dev_snap.nwk_addr, ep, key, attr.sval);
-                sent = ok;
-            } else {
-                ESP_LOGW(TAG, "SET_ATTR sval: device not found ieee=0x%llx",
-                         (unsigned long long)attr.ieee);
-            }
-        } else if (attr.has_fval) {
-            // A decimal value (21.5 °C): only the converter knows its scale,
-            // so it goes straight to the adapter as a Float. An integer-only
-            // converter refuses it and the SET_ACK says so; nothing truncates.
-            ZapDevice dev_snap;
-            if (zigbee_pool_snapshot(attr.ieee, &dev_snap) && dev_snap.model_id[0]) {
-                const uint8_t ep = (attr.ep != 0) ? attr.ep
-                                   : (dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
-                ok = zhac_adapter_send_float(attr.ieee, dev_snap.model_id,
-                                             dev_snap.manufacturer_name,
-                                             dev_snap.nwk_addr, ep, key, attr.fval);
-                sent = ok;
-            } else {
-                ESP_LOGW(TAG, "SET_ATTR fval: device not found ieee=0x%llx",
-                         (unsigned long long)attr.ieee);
-            }
+        if (attr.sval[0] || attr.has_fval) {
+            // A string (an enum option such as "restore") or a decimal
+            // (21.5 °C): only the converter knows its encoding or scale, so it
+            // goes through the one attribute-set path as such. An integer-only
+            // converter refuses a decimal and the SET_ACK says so; nothing
+            // truncates. (An older S3 sends neither; its writes take `val`.)
+            const DevCmdValue v = attr.sval[0] ? device_cmd_str(attr.sval) : device_cmd_float(attr.fval);
+            const DevCmdResult r = device_cmd_set_attr(attr.ieee, attr.ep, key, &v);
+            ok = r == DEVCMD_OK;
+            sent = ok;
+            via_service = true;
+            if (r == DEVCMD_NOT_FOUND)
+                ESP_LOGW(TAG, "SET_ATTR: device not found ieee=0x%llx", (unsigned long long)attr.ieee);
         } else if (attr.cluster == 0 && attr.attr == 0) {
         // Key-based dispatch through DeviceBackend (protocol-agnostic path)
             DeviceBackend* b = device_backend_find_by_ieee(attr.ieee);
@@ -557,18 +539,14 @@ static void handle_set_attribute(const HapFrame& req) {
             // Returns false cleanly when no TzConverter claims `key`,
             // so legacy dispatch still fires.
             if (dev_found && dev_snap.model_id[0]) {
-                bool adapter_sent = false;
-                if (strcmp(key, "state") == 0) {
-                    adapter_sent = zhac_adapter_send_bool(
-                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
-                        dev_snap.nwk_addr, ep, key, attr.val != 0);
-                } else {
-                    adapter_sent = zhac_adapter_send_uint(
-                        attr.ieee, dev_snap.model_id, dev_snap.manufacturer_name,
-                        dev_snap.nwk_addr, ep, key,
-                        static_cast<uint64_t>(attr.val));
+                // Through the one attribute-set path: "state" as a bool, any
+                // other key as the integer it is. Refused = no converter claims
+                // the key; the raw-cluster fallback below still gets its turn.
+                const DevCmdValue v = (strcmp(key, "state") == 0) ? device_cmd_bool(attr.val != 0)
+                                                                   : device_cmd_int(attr.val);
+                if (device_cmd_set_attr(attr.ieee, ep, key, &v) == DEVCMD_OK) {
+                    ok = true; sent = true; via_service = true;
                 }
-                if (adapter_sent) { ok = true; sent = true; }
             }
 
             // Legacy zcl_converter IR + tuya_to_rules path retired — ZHC's
@@ -632,16 +610,12 @@ static void handle_set_attribute(const HapFrame& req) {
     // value on the next device.get / refresh, making every toggle
     // look like it had no effect. A real attr report from the device
     // will override this optimistic value when it arrives.
-    if (ok && attr.key[0] != '\0' && !attr.sval[0]) {   // shadow holds ints (decimals ×100)
+    // device_cmd mirrors what it sent; only the raw-cluster / backend
+    // fallbacks above still need it done here.
+    if (ok && !via_service && attr.key[0] != '\0' && !attr.sval[0]) {
         const char* k = attr.key;
-        if (attr.has_fval) {
-            device_shadow_update_optimistic(attr.ieee, k, VAL_FLOAT,
-                                             static_cast<int32_t>(lroundf(attr.fval * 100.0f)));
-        } else {
-            uint8_t vt = (strcmp(k, "state") == 0) ? VAL_BOOL : VAL_INT;
-            device_shadow_update_optimistic(attr.ieee, k, vt,
-                                             static_cast<int32_t>(attr.val));
-        }
+        uint8_t vt = (strcmp(k, "state") == 0) ? VAL_BOOL : VAL_INT;
+        device_shadow_update_optimistic(attr.ieee, k, vt, static_cast<int32_t>(attr.val));
     }
 
     // T20 (pairs with T14): ALWAYS send SET_ACK, including on the adapter

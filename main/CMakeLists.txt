@@ -22,6 +22,7 @@ set(MAIN_REQUIRES
     app_update
     device_backend
     zhc_adapter
+    device_cmd
     # Backend requires are unconditional ON PURPOSE. ESP-IDF expands
     # REQUIRES in an early script-mode pass BEFORE sdkconfig is generated
     # (build-system docs: "requirements are expanded before the

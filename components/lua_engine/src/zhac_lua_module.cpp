@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "esp_log.h"
+#include "device_cmd.h"
 #include "esp_timer.h"
 
 #include "device_shadow.h"
@@ -125,8 +126,7 @@ static int l_zhac_sleep(lua_State* L) {
 }
 
 // ── zhac.set_attr(ieee_hex, key, value) → bool ────────────────────────
-// Value type dispatches: bool → send_bool, integer → send_uint,
-// string → send_string.
+// bool / integer / decimal / string, through device_cmd.
 static int l_zhac_set_attr(lua_State* L) {
     const char* ieee_s = luaL_checkstring(L, 1);
     const char* key    = luaL_checkstring(L, 2);
@@ -136,45 +136,19 @@ static int l_zhac_set_attr(lua_State* L) {
         lua_pushboolean(L, 0);
         return 1;
     }
-    // F6/F35 (FINDINGS.md): snapshot under the pool lock; the blocking
-    // radio sends below run on the detached copy — never on a raw pool
-    // pointer that a swap-with-last remove could retarget.
-    ZapDevice snap;
-    if (!zigbee_pool_snapshot(ieee, &snap)) {
-        ESP_LOGW(TAG, "set_attr: device 0x%016" PRIx64 " not in pool", ieee);
-        lua_pushboolean(L, 0);
-        return 1;
-    }
-    const uint8_t ep = snap.endpoints[0] ? snap.endpoints[0] : 1;
-
-    bool ok = false;
-    if (lua_isboolean(L, 3)) {
-        ok = zhac_adapter_send_bool(snap.ieee_addr, snap.model_id,
-                                      snap.manufacturer_name,
-                                      snap.nwk_addr, ep, key,
-                                      lua_toboolean(L, 3) != 0);
-    } else if (lua_isinteger(L, 3)) {
-        ok = zhac_adapter_send_uint(snap.ieee_addr, snap.model_id,
-                                      snap.manufacturer_name,
-                                      snap.nwk_addr, ep, key,
-                                      (uint64_t)lua_tointeger(L, 3));
-    } else if (lua_isnumber(L, 3)) {
-        // 21.5: a decimal write. The converter scales it (see
-        // zhac_adapter_send_number); an integer-only converter refuses it.
-        ok = zhac_adapter_send_number(snap.ieee_addr, snap.model_id,
-                                        snap.manufacturer_name,
-                                        snap.nwk_addr, ep, key,
-                                        (double)lua_tonumber(L, 3));
-    } else if (lua_isstring(L, 3)) {
-        ok = zhac_adapter_send_string(snap.ieee_addr, snap.model_id,
-                                        snap.manufacturer_name,
-                                        snap.nwk_addr, ep, key,
-                                        lua_tostring(L, 3));
-    } else {
-        return luaL_error(L,
-            "zhac.set_attr: value must be bool/number/string");
-    }
-    lua_pushboolean(L, ok);
+    // One attribute-set path for every transport (device_cmd): pool
+    // snapshot, value dispatch, optimistic shadow. bool / integer / decimal /
+    // string go to the converter as such; an integer-only converter refuses
+    // a decimal and this returns false.
+    DevCmdValue val;
+    if (lua_isboolean(L, 3))      val = device_cmd_bool(lua_toboolean(L, 3) != 0);
+    else if (lua_isinteger(L, 3)) val = device_cmd_int(lua_tointeger(L, 3));
+    else if (lua_isnumber(L, 3))  val = device_cmd_number((double)lua_tonumber(L, 3));
+    else if (lua_isstring(L, 3))  val = device_cmd_str(lua_tostring(L, 3));
+    else return luaL_error(L, "zhac.set_attr: value must be bool/number/string");
+    const DevCmdResult r = device_cmd_set_attr(ieee, 0, key, &val);
+    if (r == DEVCMD_NOT_FOUND) ESP_LOGW(TAG, "set_attr: device 0x%016" PRIx64 " not in pool", ieee);
+    lua_pushboolean(L, r == DEVCMD_OK);
     return 1;
 }
 

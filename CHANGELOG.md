@@ -7,6 +7,12 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Changed
+
+- **HAP `SET_ATTRIBUTE` and Lua `set_attr` go through `device_cmd`** (zhac-components): the
+  same value handling, results and shadow mirror as the wired and mono builds; the raw ZCL
+  fallbacks for keys no converter claims are unchanged.
+
 ### Fixed
 
 - **Enum writes arrive as the option name.** `SET_ATTRIBUTE` with the new `sval` field goes

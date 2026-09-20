@@ -16,6 +16,7 @@ if(IDF_TARGET STREQUAL "esp32p4")
         REQUIRES freertos esp_timer lua
         PRIV_REQUIRES spiffs event_bus metrics
                       zap_common zap_store zhc_adapter
+                      device_cmd
                       device_shadow mqtt_gw tg_gw zigbee_mgr
                       simple_rules lua_cjson
     )
