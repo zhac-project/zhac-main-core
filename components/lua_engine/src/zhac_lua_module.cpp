@@ -158,6 +158,13 @@ static int l_zhac_set_attr(lua_State* L) {
                                       snap.manufacturer_name,
                                       snap.nwk_addr, ep, key,
                                       (uint64_t)lua_tointeger(L, 3));
+    } else if (lua_isnumber(L, 3)) {
+        // 21.5: a decimal write. The converter scales it (see
+        // zhac_adapter_send_number); an integer-only converter refuses it.
+        ok = zhac_adapter_send_number(snap.ieee_addr, snap.model_id,
+                                        snap.manufacturer_name,
+                                        snap.nwk_addr, ep, key,
+                                        (double)lua_tonumber(L, 3));
     } else if (lua_isstring(L, 3)) {
         ok = zhac_adapter_send_string(snap.ieee_addr, snap.model_id,
                                         snap.manufacturer_name,
@@ -165,7 +172,7 @@ static int l_zhac_set_attr(lua_State* L) {
                                         lua_tostring(L, 3));
     } else {
         return luaL_error(L,
-            "zhac.set_attr: value must be bool/integer/string");
+            "zhac.set_attr: value must be bool/number/string");
     }
     lua_pushboolean(L, ok);
     return 1;

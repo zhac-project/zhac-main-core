@@ -9,6 +9,12 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **Enum writes arrive as the option name.** `SET_ATTRIBUTE` with the new `sval` field goes
+  to the converter as a string (`zhac_adapter_send_string`), which owns the option → raw value
+  lookup. Before, the S3 could only send a number, and the web UI's option names became 0.
+
+### Fixed
+
 - **Lua event handlers never fired.** `app_main` called `lua_engine_init()` —
   which subscribes the `on_attr_change` / `on_mqtt` / `on_boot` / `on_zcl_raw`
   bridges — *before* `event_bus_init()`, which zeroes the subscriber table. The
@@ -19,6 +25,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
   must fire on a device report. (Review 2026-09, MC-01.)
 
 ### Added
+
+- **Decimal writes.** `SET_ATTRIBUTE` with `fval` goes to the converter as a float (a 21.5 °C
+  setpoint writes 2150) and mirrors into the shadow as `VAL_FLOAT`; Lua `zhac.set_attr` takes any
+  number, not only integers.
 
 - **GROUP_MEMBER_QUERY handler — read a device's ZCL group membership (inc 2b).**
   `handle_group_member_query` decodes `{ieee, ep}`, calls

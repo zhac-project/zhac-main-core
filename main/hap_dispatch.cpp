@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#include <cmath>
 #include <cstdio>
 #include <cstdarg>
 #include <cassert>
@@ -500,8 +501,41 @@ static void handle_set_attribute(const HapFrame& req) {
     {
         const char* key = (attr.key[0] != '\0') ? attr.key : "state";
 
+        if (attr.sval[0]) {
+            // A string value — an enum option such as "restore". Only the
+            // converter's lookup knows its raw encoding, so hand it over as
+            // text. (An older S3 never sends sval; its enum writes still go
+            // through `val` below, as before.)
+            ZapDevice dev_snap;
+            if (zigbee_pool_snapshot(attr.ieee, &dev_snap) && dev_snap.model_id[0]) {
+                const uint8_t ep = (attr.ep != 0) ? attr.ep
+                                   : (dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
+                ok = zhac_adapter_send_string(attr.ieee, dev_snap.model_id,
+                                              dev_snap.manufacturer_name,
+                                              dev_snap.nwk_addr, ep, key, attr.sval);
+                sent = ok;
+            } else {
+                ESP_LOGW(TAG, "SET_ATTR sval: device not found ieee=0x%llx",
+                         (unsigned long long)attr.ieee);
+            }
+        } else if (attr.has_fval) {
+            // A decimal value (21.5 °C): only the converter knows its scale,
+            // so it goes straight to the adapter as a Float. An integer-only
+            // converter refuses it and the SET_ACK says so; nothing truncates.
+            ZapDevice dev_snap;
+            if (zigbee_pool_snapshot(attr.ieee, &dev_snap) && dev_snap.model_id[0]) {
+                const uint8_t ep = (attr.ep != 0) ? attr.ep
+                                   : (dev_snap.endpoint_count > 0 ? dev_snap.endpoints[0] : 1);
+                ok = zhac_adapter_send_float(attr.ieee, dev_snap.model_id,
+                                             dev_snap.manufacturer_name,
+                                             dev_snap.nwk_addr, ep, key, attr.fval);
+                sent = ok;
+            } else {
+                ESP_LOGW(TAG, "SET_ATTR fval: device not found ieee=0x%llx",
+                         (unsigned long long)attr.ieee);
+            }
+        } else if (attr.cluster == 0 && attr.attr == 0) {
         // Key-based dispatch through DeviceBackend (protocol-agnostic path)
-        if (attr.cluster == 0 && attr.attr == 0) {
             DeviceBackend* b = device_backend_find_by_ieee(attr.ieee);
             if (b && b->write_attr) {
                 ok = b->write_attr(attr.ieee, attr.ep, key, attr.val);
@@ -598,11 +632,16 @@ static void handle_set_attribute(const HapFrame& req) {
     // value on the next device.get / refresh, making every toggle
     // look like it had no effect. A real attr report from the device
     // will override this optimistic value when it arrives.
-    if (ok && attr.key[0] != '\0') {
+    if (ok && attr.key[0] != '\0' && !attr.sval[0]) {   // shadow holds ints (decimals ×100)
         const char* k = attr.key;
-        uint8_t vt = (strcmp(k, "state") == 0) ? VAL_BOOL : VAL_INT;
-        device_shadow_update_optimistic(attr.ieee, k, vt,
-                                         static_cast<int32_t>(attr.val));
+        if (attr.has_fval) {
+            device_shadow_update_optimistic(attr.ieee, k, VAL_FLOAT,
+                                             static_cast<int32_t>(lroundf(attr.fval * 100.0f)));
+        } else {
+            uint8_t vt = (strcmp(k, "state") == 0) ? VAL_BOOL : VAL_INT;
+            device_shadow_update_optimistic(attr.ieee, k, vt,
+                                             static_cast<int32_t>(attr.val));
+        }
     }
 
     // T20 (pairs with T14): ALWAYS send SET_ACK, including on the adapter
