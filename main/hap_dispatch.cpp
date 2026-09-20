@@ -775,28 +775,18 @@ static void handle_device_set_name(const HapFrame& f) {
 
     if (hap_json_decode_device_set_name(f.payload, f.payload_len,
                                          &ieee, new_name, sizeof(new_name))) {
-        // F6/F35: in-place rename via the locked visitor; NVS dirty-mark,
-        // rules reload and encode then run on the detached snapshot
-        // OUTSIDE the lock (mark_dirty's table-full fallback writes flash;
-        // simple_rules_reload takes the pool lock itself).
-        struct RenameCtx { const char* name; ZapDevice snap; } rc{ new_name, {} };
-        if (zigbee_pool_with_device(ieee,
-                [](ZapDevice* d, void* p) {
-                    auto* c = static_cast<RenameCtx*>(p);
-                    strncpy(d->friendly_name, c->name, sizeof(d->friendly_name) - 1);
-                    d->friendly_name[sizeof(d->friendly_name) - 1] = '\0';
-                    c->snap = *d;
-                }, &rc)) {
-            zap_store_mark_dirty(&rc.snap, ZAP_PERSIST_HIGH);
-            simple_rules_reload(); // re-resolve friendly names
-            // Legacy zcl_converter augmentation retired — the base encoder
-            // already carries what the UI needs after a rename.
+        // device_cmd validates, persists (outside the pool lock) and runs the
+        // changed hook, which on this core reloads the rules' name table.
+        const DevCmdResult r = device_cmd_rename(ieee, new_name);
+        ZapDevice snap{};
+        if (r == DEVCMD_OK && zigbee_pool_snapshot(ieee, &snap)) {
             encode_ok = hap_json_encode_device_info(tx_buf, sizeof(tx_buf),
-                                                     &tx_len, &rc.snap,
+                                                     &tx_len, &snap,
                                                      &resolve_dev_labels);
         } else {
-            encode_ok = hap_json_encode_device_info_err(tx_buf, sizeof(tx_buf),
-                                                         &tx_len, "not found");
+            encode_ok = hap_json_encode_device_info_err(
+                tx_buf, sizeof(tx_buf), &tx_len,
+                r == DEVCMD_OK ? "not found" : device_cmd_result_str(r));
         }
     } else {
         encode_ok = hap_json_encode_device_info_err(tx_buf, sizeof(tx_buf),
@@ -1051,16 +1041,7 @@ static void handle_script_read_req(const HapFrame& f) {
 static void handle_permit_join(const HapFrame& f) {
     uint8_t dur = 0;
     if (hap_json_decode_permit_join(f.payload, f.payload_len, &dur)) {
-        // T20: clamp to ≤254. Per ZDO Mgmt_Permit_Joining, duration 0xFF
-        // (255) means "permanently open" — a foot-gun if the SPA ever
-        // sends 255 (intending "max"), leaving the network open to
-        // joining forever with no auto-close. 254 s is the longest
-        // bounded window; 0 still closes.
-        if (dur == 255) {
-            ESP_LOGW(TAG, "PERMIT_JOIN 255 (permanent) clamped to 254 s");
-            dur = 254;
-        }
-        zigbee_permit_join(dur);
+        device_cmd_permit_join(dur);   // T20: 255 (permanent) is clamped to 254 s in there
     } else {
         ESP_LOGW(TAG, "PERMIT_JOIN decode failed");
     }
@@ -1140,59 +1121,10 @@ static void handle_device_delete(const HapFrame& f) {
     if (hap_json_decode_device_delete(f.payload, f.payload_len, &ieee, &hard)) {
         ESP_LOGI(TAG, "DEVICE_DELETE ieee=0x%016llX hard=%d",
                  (unsigned long long)ieee, (int)hard);
-        // F6/F35: one locked section does find + nwk copy + (soft path)
-        // mark + snapshot; the blocking leave request and the NVS
-        // dirty-mark then run on detached copies outside the lock.
-        bool dev_found = false;
-        uint16_t nwk_cp = 0xFFFE;
-        ZapDevice snap;
-        zigbee_pool_lock();
-        if (ZapDevice* dev = pool_find_by_ieee(ieee)) {
-            dev_found = true;
-            nwk_cp = dev->nwk_addr;
-            if (!hard) {
-                // Soft-remove: keep the slot + NVS record so a rejoin
-                // restores configure state without rediscovery. Hide
-                // from the UI until then (see hap_json device-list
-                // filter).
-                zap_dev_mark_removed(dev);
-                snap = *dev;
-            }
-        }
-        zigbee_pool_unlock();
-        if (dev_found) {
-            zigbee_leave_req(nwk_cp, ieee);
-            if (hard) {
-                // "Forget forever" — drop NVS record, pool slot, and
-                // every per-ieee cache so the next rejoin runs a full
-                // interview against the current device-definition
-                // library (no fast-path, no stale shadow attrs, no
-                // stale adapter def pointer).
-                zap_store_delete_device(ieee);
-                device_shadow_remove(ieee);   // T27: full teardown (slot +
-                                              // timers + 'a'&'c' NVS keys), not
-                                              // just clear_attrs which leaked
-                                              // the slot/timers/config blob.
-                zhac_adapter_invalidate_def_cache(ieee);
-                zhac_adapter_fallback_clear(ieee);
-                ok = zigbee_pool_remove(ieee);
-                ESP_LOGI(TAG, "DEVICE_DELETE hard sweep done ieee=0x%016llX "
-                               "pool_removed=%d", (unsigned long long)ieee, (int)ok);
-            } else {
-                zap_store_mark_dirty(&snap, ZAP_PERSIST_LOW);
-                ok = true;
-            }
-        } else if (hard) {
-            // Pool entry already gone (orphaned NVS record or stale
-            // shadow / adapter cache). Still do the full sweep so the
-            // UI's "hard" option is guaranteed idempotent.
-            zap_store_delete_device(ieee);
-            device_shadow_remove(ieee);   // T27: idempotent — no-op if the
-                                          // slot is already gone; still erases
-                                          // any orphaned 'a'/'c' NVS keys.
-            zhac_adapter_invalidate_def_cache(ieee);
-            ok = true;
-        }
+        // One contract for every core (device_cmd_remove): soft = leave +
+        // tombstone (persisted); hard = leave + full idempotent sweep of pool
+        // slot, shadow, converter caches and the stored row.
+        ok = device_cmd_remove(ieee, hard) == DEVCMD_OK;
     }
     if (hap_json_encode_device_delete_ack(tx_buf, sizeof(tx_buf), &tx_len, ok)) {
         hap_send(HapMsgType::DEVICE_DELETE_ACK, tx_buf, tx_len, HAP_FLAG_NO_ACK, f.seq);

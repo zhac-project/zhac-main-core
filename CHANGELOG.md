@@ -9,6 +9,12 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- **Device rename, delete and permit join go through `device_cmd`** (zhac-components): names
+  are validated the same way as on the other cores (1–29 bytes, no quotes, backslashes or
+  control characters), the 255 → 254 permit-join clamp lives in the shared service, and
+  delete follows the one soft/hard contract (unchanged behaviour here; the wired and mono
+  builds caught up to it).
+
 - **HAP `SET_ATTRIBUTE` and Lua `set_attr` go through `device_cmd`** (zhac-components): the
   same value handling, results and shadow mirror as the wired and mono builds; the raw ZCL
   fallbacks for keys no converter claims are unchanged.

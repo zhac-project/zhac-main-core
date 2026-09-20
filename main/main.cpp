@@ -28,6 +28,7 @@
 #include "zigbee_pool.h"
 #include "zap_store.h"
 #include "simple_rules.h"
+#include "device_cmd.h"
 #include "rule_store.h"
 #include "esp_timer.h"
 #include "mqtt_gw.h"
@@ -172,6 +173,9 @@ extern "C" void app_main() {
     rule_store_flush_init();
     esp_register_shutdown_handler(rule_store_flush_now);
     simple_rules_init();
+    // Rules re-resolve friendly names after a rename (device_cmd cannot call
+    // simple_rules itself: simple_rules depends on it).
+    device_cmd_set_changed_hook([](uint64_t) { simple_rules_reload(); });
     mqtt_gw_init();
     tg_gw_init();
     hap_slave_init();
