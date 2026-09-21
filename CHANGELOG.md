@@ -9,6 +9,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- **`device.get` reports the power source** (`ps`), so the S3's Home Assistant bridge can
+  give battery devices their own availability. A soft delete now publishes `DEVICE_LEAVE`
+  like a hard one, so the S3 and Home Assistant drop the device at once.
+
 - **Device rename, delete and permit join go through `device_cmd`** (zhac-components): names
   are validated the same way as on the other cores (1–29 bytes, no quotes, backslashes or
   control characters), the 255 → 254 permit-join clamp lives in the shared service, and
