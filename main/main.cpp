@@ -336,26 +336,9 @@ static void task_zigbee(void*) {
 
 static void task_event_bus(void*) {
     ESP_LOGI(TAG, "TaskEventBus started");
-
     esp_task_wdt_add(nullptr);   // T20: real WDT coverage (was tautological feeder)
-    while (true) {
-        esp_task_wdt_reset();    // cycles every ≤20 ms — well within the WDT window
-        uint8_t processed = 0;
-        // Drain EVERY event type the enum defines (1 .. _COUNT-1). Derive the
-        // range from the enum rather than a hand-maintained list: the old fixed
-        // 1..10 list silently stopped draining a newly-added type
-        // (SHADOW_OPTIMISTIC = 11), so its subscriber queue filled forever
-        // ("queue full type=11 — oldest overwritten") and optimistic shadow
-        // updates never forwarded to S3. Draining a type with no subscribers is
-        // a cheap no-op.
-        for (uint8_t t = 1; t < static_cast<uint8_t>(EventType::_COUNT); t++) {
-            processed += event_bus_drain(static_cast<EventType>(t), 0);
-        }
-        // If no events, sleep briefly to yield CPU rather than spin
-        if (processed == 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-    }
+    // Sleeps until a publish, with a 1 s sweep -- the watchdog window is 10 s.
+    event_bus_pump_run([] { esp_task_wdt_reset(); });
 }
 
 static void task_log_drain(void*) {

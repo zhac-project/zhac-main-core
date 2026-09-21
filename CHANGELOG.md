@@ -25,6 +25,9 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
+  publish instead of polling every 20 ms (shared `event_bus_pump_run`).
+
 - **Enum writes arrive as the option name.** `SET_ATTRIBUTE` with the new `sval` field goes
   to the converter as a string (`zhac_adapter_send_string`), which owns the option → raw value
   lookup. Before, the S3 could only send a number, and the web UI's option names became 0.
