@@ -28,6 +28,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "zhac_task.h"
 
 extern "C" {
 #include "lua_alloc.h"
@@ -862,7 +863,7 @@ extern "C" int lua_scheduler_spawn(lua_State* L) {
 }
 
 extern "C" bool lua_engine_scheduler_start(lua_State* L) {
-    s_resume_q = xQueueCreate(CONFIG_LUA_ENGINE_RESUME_QUEUE_DEPTH,
+    s_resume_q = zhac_queue_create(CONFIG_LUA_ENGINE_RESUME_QUEUE_DEPTH,
                                sizeof(LuaMsg));
     if (!s_resume_q) {
         ESP_LOGE(TAG, "resume queue create failed");
@@ -874,14 +875,14 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
     // per-step setjmp frame instead of abort()ing the chip.
     lua_atpanic(L, lua_panic_handler);
 
-    BaseType_t ok = xTaskCreate(task_lua, "TaskLua",
+    BaseType_t ok = zhac_task_create(task_lua, "TaskLua",
                                  CONFIG_LUA_ENGINE_TASK_STACK_BYTES,
                                  L,
                                  CONFIG_LUA_ENGINE_TASK_PRIORITY,
                                  NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "TaskLua create failed");
-        vQueueDelete(s_resume_q);
+        zhac_queue_delete(s_resume_q);
         s_resume_q = NULL;
         return false;
     }

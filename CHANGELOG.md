@@ -9,6 +9,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Changed
 
+- `lua_engine`: `TaskLua` + the resume queue are created through `zhac_task.h` (PSRAM on XIP-from-PSRAM builds, unchanged on the P4); `LUA_ENGINE_INTERNAL_SMALL_THRESHOLD` now allows `0` = every Lua allocation in PSRAM.
 - **`device.get` reports the power source** (`ps`), so the S3's Home Assistant bridge can
   give battery devices their own availability. A soft delete now publishes `DEVICE_LEAVE`
   like a hard one, so the S3 and Home Assistant drop the device at once.
