@@ -26,6 +26,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **Lua `zhac.on_mqtt(topic, fn)`, `zhac.on_attr_change(ieee, key, fn)` and `zhac.on_cron(expr, fn)` work as documented.** Registration only accepted a bare function, so the documented forms raised "bad argument #1" and the script failed to load; `on_cron` handlers were stored but never called (no cron dispatch existed). Filters are now checked before a handler coroutine starts (exact topic; IEEE with or without `0x`, any case; key or `"*"`; `nil` = any), and TaskLua evaluates cron expressions once per second on the local clock (5- or 6-field; invalid ones are a registration error). The bare-function forms still receive every event; `on_cron(fn)` alone is ignored with a warning.
 - **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
   publish instead of polling every 20 ms (shared `event_bus_pump_run`).
 

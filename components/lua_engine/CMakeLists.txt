@@ -14,7 +14,7 @@ if(IDF_TARGET STREQUAL "esp32p4")
         INCLUDE_DIRS "include"
         PRIV_INCLUDE_DIRS "src"
         REQUIRES freertos esp_timer lua
-        PRIV_REQUIRES spiffs event_bus metrics
+        PRIV_REQUIRES spiffs event_bus metrics cron_parser
                       zap_common zap_store zhc_adapter
                       device_cmd
                       device_shadow mqtt_gw tg_gw zigbee_mgr

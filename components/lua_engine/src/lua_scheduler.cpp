@@ -20,6 +20,8 @@
 #include <csetjmp>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <strings.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -45,6 +47,7 @@ extern "C" {
 // and truncated key/value strings. Pull the header so the offsets track
 // the struct automatically if the schema moves again.
 #include "zcl_attribute.h"
+#include "cron_parser.h"
 #include "event_bus.h"
 
 static const char* TAG = "lua_sched";
@@ -607,6 +610,39 @@ static const char* reg_key_for(LuaEventKind k) {
     return NULL;
 }
 
+// A handler entry is a bare function (every event) or a table
+// {fn, a, b} from zhac.on_mqtt(topic, fn) / on_attr_change(ieee, key, fn).
+// Replaces the entry on the stack top with its function and returns true
+// when the event passes the filter; pops it and returns false otherwise.
+static bool ieee_equal(const char* want, const char* have_0x) {
+    if (want[0] == '0' && (want[1] == 'x' || want[1] == 'X')) want += 2;
+    return strcasecmp(want, have_0x + 2) == 0;
+}
+static bool entry_matches(lua_State* L, const EventArgs* e) {
+    if (lua_isfunction(L, -1)) return true;
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return false; }
+    bool ok = true;
+    lua_getfield(L, -1, "a");
+    lua_getfield(L, -2, "b");
+    const char* a = lua_tostring(L, -2);
+    const char* b = lua_tostring(L, -1);
+    if (e->kind == LUA_EVT_MQTT) {
+        if (a) ok = strncmp(a, (const char*)e->payload, 64) == 0;
+    } else if (e->kind == LUA_EVT_ATTR) {
+        uint64_t ieee; memcpy(&ieee, e->payload + offsetof(ZclAttrEvent, ieee), 8);
+        char hex[20];
+        snprintf(hex, sizeof(hex), "0x%016llx", (unsigned long long)ieee);
+        const char* key = (const char*)(e->payload + offsetof(ZclAttrEvent, key));
+        if (a && !ieee_equal(a, hex)) ok = false;
+        if (ok && b && strcmp(b, "*") != 0 && strncmp(b, key, ATTR_KEY_MAX) != 0) ok = false;
+    }
+    lua_pop(L, 2);
+    if (!ok) { lua_pop(L, 1); return false; }
+    lua_getfield(L, -1, "fn");
+    lua_remove(L, -2);                   // entry table
+    return lua_isfunction(L, -1) || (lua_pop(L, 1), false);
+}
+
 // Iterate the registered handler table for this event, spawning one
 // coroutine per handler with event-specific args pushed.
 static void dispatch_event(lua_State* L, const EventArgs* e) {
@@ -620,8 +656,8 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
     }
     const lua_Integer n = luaL_len(L, -1);
     for (lua_Integer i = 1; i <= n; ++i) {
-        lua_geti(L, -1, i);    // push handler fn
-        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
+        lua_geti(L, -1, i);    // push handler entry
+        if (!entry_matches(L, e)) continue;   // leaves the handler fn
 
         if (lua_scheduler_at_capacity()) {
             lua_pop(L, 1);     // drop handler fn
@@ -788,6 +824,39 @@ static void load_all_scripts(lua_State* L) {
     ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
 }
 
+// zhac.on_cron(expr, fn): entries carry a parsed CronExpr (`c`). Checked
+// once per elapsed second from the loop below; a clock jump (NTP set,
+// time zone change) does not replay the skipped seconds.
+static void cron_tick(lua_State* L) {
+    static time_t last = 0;
+    const time_t now = time(nullptr);
+    if (now < 1600000000) return;                    // clock not set yet
+    if (last == 0 || now < last || now - last > 5) last = now - 1;
+    if (now == last) return;
+    lua_getfield(L, LUA_REGISTRYINDEX, "zhac_on_cron_refs");
+    if (lua_istable(L, -1)) {
+        const lua_Integer n = luaL_len(L, -1);
+        for (time_t t = last + 1; t <= now; ++t) {
+            for (lua_Integer i = 1; i <= n; ++i) {
+                lua_geti(L, -1, i);
+                if (!lua_istable(L, -1)) { lua_pop(L, 1); continue; }
+                lua_getfield(L, -1, "c");
+                const auto* ce = static_cast<const CronExpr*>(lua_touserdata(L, -1));
+                lua_pop(L, 1);
+                if (!ce || !cron_matches(*ce, t)) { lua_pop(L, 1); continue; }
+                lua_getfield(L, -1, "fn");
+                lua_remove(L, -2);
+                if (!lua_isfunction(L, -1) || lua_scheduler_at_capacity()) { lua_pop(L, 1); continue; }
+                int ref = LUA_NOREF;
+                lua_State* co = spawn_coroutine(L, &ref);   // consumes fn
+                if (co) resume_and_settle(L, co, ref, 0, "cron handler error");
+            }
+        }
+    }
+    lua_pop(L, 1);
+    last = now;
+}
+
 static void task_lua(void* arg) {
     lua_State* L = (lua_State*)arg;
     ESP_LOGI(TAG, "TaskLua started");
@@ -804,7 +873,8 @@ static void task_lua(void* arg) {
         // engine still wakes periodically to pet the WDT instead of
         // looking wedged. main.cpp subscribes TaskLua to the TWDT.
         esp_task_wdt_reset();
-        if (xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(2000)) != pdTRUE) continue;
+        // 1 s so zhac.on_cron gets second resolution (also pets the WDT).
+        const bool got = xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
 
         // T20 (panic backstop): wrap every VM-touching dispatch step in a
         // setjmp frame so an unprotected OOM/internal raise (e.g. inside
@@ -825,6 +895,9 @@ static void task_lua(void* arg) {
         }
         s_panic_armed = true;
         s_inflight = {};   // CODEX M-03: clean slate for this dispatch step
+
+        cron_tick(L);
+        if (!got) { s_panic_armed = false; continue; }
 
         if (m.kind == MSG_RESUME) {
             resume_coroutine(L, &m.resume);

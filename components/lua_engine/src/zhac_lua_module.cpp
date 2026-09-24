@@ -20,6 +20,7 @@
 #include "device_cmd.h"
 #include "esp_timer.h"
 
+#include "cron_parser.h"
 #include "device_shadow.h"
 #include "event_bus.h"
 #include "mqtt_gw.h"
@@ -73,6 +74,55 @@ int register_handler(lua_State* L, const char* reg_key) {
     }
     const lua_Integer len = luaL_len(L, -1);
     lua_pushvalue(L, 1);
+    lua_seti(L, -2, len + 1);
+    lua_pop(L, 1);
+    return 0;
+}
+
+// Documented form: on_x(filter1 [, filter2], fn). The entry becomes a table
+// {fn=fn, a=filter1, b=filter2}; the scheduler checks the filter before it
+// spawns a coroutine (lua_scheduler.cpp, entry_matches). A bare fn, the
+// old form, is still accepted and receives every event. A nil filter
+// matches anything. For cron the expression is parsed here (a bad one is a
+// Lua error at registration, not a silent never-fires) and kept as `c`.
+int register_filtered(lua_State* L, const char* reg_key, int nfilters, bool cron) {
+    if (lua_gettop(L) == 1 && lua_isfunction(L, 1)) {
+        if (cron) {
+            // Old scripts may still call on_cron(fn); it never fired. Warn
+            // instead of failing the whole script load.
+            ESP_LOGW("lua_script", "zhac.on_cron(fn) without an expression is ignored; use on_cron(\"<cron>\", fn)");
+            return 0;
+        }
+        return register_handler(L, reg_key);
+    }
+    luaL_checktype(L, nfilters + 1, LUA_TFUNCTION);
+    for (int i = 1; i <= nfilters; ++i) {
+        if (!lua_isnil(L, i)) luaL_checkstring(L, i);
+    }
+    lua_getfield(L, LUA_REGISTRYINDEX, reg_key);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, reg_key);
+    }
+    lua_createtable(L, 0, 4);
+    lua_pushvalue(L, nfilters + 1);
+    lua_setfield(L, -2, "fn");
+    static const char* const kNames[] = { "a", "b" };
+    for (int i = 1; i <= nfilters; ++i) {
+        if (lua_isnil(L, i)) continue;
+        lua_pushvalue(L, i);
+        lua_setfield(L, -2, kNames[i - 1]);
+    }
+    if (cron) {
+        auto* ce = static_cast<CronExpr*>(lua_newuserdatauv(L, sizeof(CronExpr), 0));
+        if (!cron_parse(lua_tostring(L, 1), *ce)) {
+            return luaL_error(L, "zhac.on_cron: bad cron expression '%s'", lua_tostring(L, 1));
+        }
+        lua_setfield(L, -2, "c");
+    }
+    const lua_Integer len = luaL_len(L, -2);
     lua_seti(L, -2, len + 1);
     lua_pop(L, 1);
     return 0;
@@ -230,9 +280,11 @@ static int l_zhac_telegram_send(lua_State* L) {
 }
 
 // ── on_* registrations ───────────────────────────────────────────────
-static int l_zhac_on_attr_change(lua_State* L) { return register_handler(L, REG_ON_ATTR); }
-static int l_zhac_on_cron       (lua_State* L) { return register_handler(L, REG_ON_CRON); }
-static int l_zhac_on_mqtt       (lua_State* L) { return register_handler(L, REG_ON_MQTT); }
+// on_attr_change(ieee_hex, key, fn) · on_mqtt(topic, fn) · on_cron(expr, fn);
+// each also takes a bare fn (every event; not for cron).
+static int l_zhac_on_attr_change(lua_State* L) { return register_filtered(L, REG_ON_ATTR, 2, false); }
+static int l_zhac_on_cron       (lua_State* L) { return register_filtered(L, REG_ON_CRON, 1, true); }
+static int l_zhac_on_mqtt       (lua_State* L) { return register_filtered(L, REG_ON_MQTT, 1, false); }
 static int l_zhac_on_boot       (lua_State* L) { return register_handler(L, REG_ON_BOOT); }
 static int l_zhac_on_zcl_raw    (lua_State* L) { return register_handler(L, REG_ON_RAW);  }
 
