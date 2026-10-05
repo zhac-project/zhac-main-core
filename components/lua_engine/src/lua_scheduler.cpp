@@ -989,7 +989,9 @@ static void task_lua(void* arg) {
         // looking wedged. main.cpp subscribes TaskLua to the TWDT.
         esp_task_wdt_reset();
         // 1 s so zhac.on_cron gets second resolution (also pets the WDT).
-        const bool got = xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
+        // volatile: `got` is read after the setjmp below; without it the Xtensa GCC (ESP32-S3, mono-core)
+        // stops on -Werror=clobbered.
+        const volatile bool got = xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
 
         // T20 (panic backstop): wrap every VM-touching dispatch step in a
         // setjmp frame so an unprotected OOM/internal raise (e.g. inside
