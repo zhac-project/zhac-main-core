@@ -7,6 +7,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Added
+
+- **`lua_engine_set_error_hook(fn(name, line, message))`** (`lua_engine`, spec 2026-10-05 §3.6): called on TaskLua where script errors are logged (compile at load, reload or run; an error while running), with the script's name and line from Lua's `[string "<name>"]:<line>:` prefix and the text cut to 120 bytes on a character boundary; at most once per script per 10 s. The wired firmware turns it into the `script.error` event. Pure parts in `include/lua_engine_err.h`, host test `test/host/lua_err_test.cpp`.
+
 ### Changed
 
 - `lua_engine`: `TaskLua` + the resume queue are created through `zhac_task.h` (PSRAM on XIP-from-PSRAM builds, unchanged on the P4); `LUA_ENGINE_INTERNAL_SMALL_THRESHOLD` now allows `0` = every Lua allocation in PSRAM.

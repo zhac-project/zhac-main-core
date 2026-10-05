@@ -174,6 +174,7 @@ bool     lua_engine_check_syntax(const char* n, const char* s,
     if (l) *l = 1;
     return true;   // engine disabled → no syntax checks, pretend OK
 }
+void     lua_engine_set_error_hook(LuaErrorHook hook) { (void)hook; }
 size_t   lua_engine_heap_used_bytes(void)  { return 0; }
 size_t   lua_engine_heap_peak_bytes(void)  { return 0; }
 uint16_t lua_engine_live_coroutines(void)  { return 0; }

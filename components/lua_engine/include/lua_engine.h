@@ -55,6 +55,13 @@ bool lua_engine_check_syntax(const char* name, const char* src,
                               char* err_out, size_t err_cap,
                               int*   line_out);
 
+// script.error (spec 2026-10-05 §3.6): called on TaskLua when a script fails to compile at load, reload
+// or run, or raises an error while running. `name` and `line` come from Lua's `[string "<name>"]:<line>:`
+// prefix ("" and 0 when unknown); `message` is Lua's text without it, at most 120 bytes. At most once per
+// script per 10 s; the rest go to the log only. NULL = none.
+typedef void (*LuaErrorHook)(const char* name, int line, const char* message);
+void lua_engine_set_error_hook(LuaErrorHook hook);
+
 #ifdef __cplusplus
 }
 #endif

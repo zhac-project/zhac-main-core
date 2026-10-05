@@ -40,6 +40,7 @@ extern "C" {
 #include "lua_scheduler.h"
 }
 #include "metrics/metrics_macros.h"
+#include "lua_engine_err.h"
 // T20: derive the ZclAttrEvent payload layout from the canonical schema
 // constants instead of hardcoded offsets. event_bus schema v6 widened
 // ATTR_KEY_MAX 20→28, which slid the value union from offset 36 to 44;
@@ -82,6 +83,24 @@ static volatile bool s_panic_armed = false;
 // coroutine is in flight at a time. POD — longjmp bypasses C++ destructors.
 struct InFlightCo { int ref = LUA_NOREF; bool counted = false; };
 static InFlightCo s_inflight;
+
+// ── script.error reports (spec 2026-10-05 §3.6) ───────────────────────
+static std::atomic<LuaErrorHook> s_error_hook{nullptr};
+static LuaErrGate                s_err_gate;   // TaskLua only
+
+extern "C" void lua_engine_set_error_hook(LuaErrorHook hook) { s_error_hook.store(hook); }
+
+// Hands one Lua error (already logged by the caller) to the hook, at most once per script per 10 s.
+// `script`: the script being loaded or run, when the caller knows it.
+static void report_error(const char* script, const char* msg) {
+    const LuaErrorHook hook = s_error_hook.load();
+    if (!hook) return;
+    LuaErrInfo e;
+    lua_err_parse(msg, script, &e);
+    if (lua_err_gate_due(&s_err_gate, e.name, static_cast<uint32_t>(esp_timer_get_time() / 1000))) {
+        hook(e.name, e.line, e.message);
+    }
+}
 
 static int lua_panic_handler(lua_State* L) {
     const char* msg = lua_tostring(L, -1);
@@ -442,8 +461,10 @@ extern "C" bool lua_scheduler_push_load_all(void) {
 // stays anchored by the fresh ref the yield path (zhac.sleep) took
 // before yielding. `err_ctx` prefixes the error log so each call site
 // keeps its existing message.
+// `script` names the script for script.error when the caller knows it (a load or a named run), else
+// nullptr: Lua's own prefix names it.
 static void resume_and_settle(lua_State* L, lua_State* co, int ref,
-                              int nargs, const char* err_ctx) {
+                              int nargs, const char* err_ctx, const char* script) {
     int nres = 0;
     arm_resume_deadline(co);
     const int status = lua_resume(co, L, nargs, &nres);
@@ -462,6 +483,7 @@ static void resume_and_settle(lua_State* L, lua_State* co, int ref,
         const char* err = lua_tostring(co, -1);
         ESP_LOGE(TAG, "%s: %s", err_ctx, err ? err : "(no message)");
         lua_scheduler_error_bump();
+        report_error(script, err);
     }
     lua_pop(co, (status == LUA_OK) ? nres : 1);
     luaL_unref(L, LUA_REGISTRYINDEX, ref);
@@ -502,7 +524,7 @@ static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
 
     for (int i = 0; i < r->argc; ++i) lua_pushinteger(co, r->argv[i]);
 
-    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error");
+    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error", nullptr);
 }
 
 // Marshal event fields onto a coroutine's stack. Returns argc.
@@ -676,7 +698,7 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
         // as nargs so Lua hands them to the function. Our spawn ref is
         // settled on every outcome — on yield, zhac.sleep's own ref
         // takes over and the timer slot pushes the resume when ready.
-        resume_and_settle(L, co, ref, argc, "handler error");
+        resume_and_settle(L, co, ref, argc, "handler error", nullptr);
     }
     lua_pop(L, 1);                       // handler table
 }
@@ -707,6 +729,7 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     if (luaL_loadbufferx(L, buf, (size_t)n, r->name, "t") != LUA_OK) {
         ESP_LOGE(TAG, "script.run '%s' compile error: %s",
                  r->name, lua_tostring(L, -1));
+        report_error(r->name, lua_tostring(L, -1));
         lua_pop(L, 1);
         return;
     }
@@ -739,7 +762,7 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
 
     char err_ctx[48];   // "lua.run '<name≤31>' error" — worst case 47 + NUL
     snprintf(err_ctx, sizeof(err_ctx), "lua.run '%s' error", r->name);
-    resume_and_settle(L, co, ref, argc, err_ctx);
+    resume_and_settle(L, co, ref, argc, err_ctx, r->name);
 }
 
 // ── Boot-time load-all (MSG_LOAD_ALL) ─────────────────────────────────
@@ -779,6 +802,7 @@ static bool load_one_script(lua_State* L, const char* name) {
     }
     if (luaL_loadbufferx(L, buf, (size_t)n, name, "t") != LUA_OK) {
         ESP_LOGE(TAG, "compile '%s': %s", name, lua_tostring(L, -1));
+        report_error(name, lua_tostring(L, -1));
         lua_pop(L, 1);
         return false;
     }
@@ -806,7 +830,7 @@ static bool load_one_script(lua_State* L, const char* name) {
     // %.24s: cache names are char[25], but the compiler can't see that
     // bound through the const char* param (-Werror=format-truncation).
     snprintf(err_ctx, sizeof(err_ctx), "script '%.24s' error", name);
-    resume_and_settle(L, co, ref, 0, err_ctx);
+    resume_and_settle(L, co, ref, 0, err_ctx, name);
     return true;   // loaded = compiled + started; runtime errors are
                    // logged/counted by resume_and_settle, as before
 }
@@ -849,7 +873,7 @@ static void cron_tick(lua_State* L) {
                 if (!lua_isfunction(L, -1) || lua_scheduler_at_capacity()) { lua_pop(L, 1); continue; }
                 int ref = LUA_NOREF;
                 lua_State* co = spawn_coroutine(L, &ref);   // consumes fn
-                if (co) resume_and_settle(L, co, ref, 0, "cron handler error");
+                if (co) resume_and_settle(L, co, ref, 0, "cron handler error", nullptr);
             }
         }
     }
