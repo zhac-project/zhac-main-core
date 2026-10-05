@@ -168,6 +168,7 @@ typedef struct {
     esp_timer_handle_t handle;
     int                coroutine_ref;   // -1 = free
     std::atomic<bool>  in_use;          // release/acquire — see on_timer_fire / slot_acquire
+    uint32_t           gen;             // the reload generation that armed it (s_gen below)
 } TimerSlot;
 
 static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
@@ -181,11 +182,14 @@ static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
 //  - MSG_RUN_NAMED: compile + run one named script from the cache.
 //  - MSG_LOAD_ALL:  boot-time pass — compile + start every stored
 //                   script. No payload.
+//  - MSG_RELOAD:    script.reload — a fresh lua_State with every stored
+//                   script (spec 2026-10-05 §3.5).
 enum LuaMsgKind : uint8_t {
     MSG_RESUME    = 0,
     MSG_EVENT     = 1,
     MSG_RUN_NAMED = 2,
     MSG_LOAD_ALL  = 3,
+    MSG_RELOAD    = 4,
 };
 
 enum LuaEventKind : uint8_t {
@@ -222,15 +226,32 @@ typedef struct {
 } RunNamedArgs;
 
 typedef struct {
+    uint32_t seq;                 // the lua_engine_reload() call waiting for this pass
+} ReloadArgs;
+
+typedef struct {
     LuaMsgKind kind;
+    uint32_t   gen;               // s_gen when queued; a reload drops older ones
     union {
         ResumeArgs   resume;
         EventArgs    event;
         RunNamedArgs named;
+        ReloadArgs   reload;
     };
 } LuaMsg;
 
 static QueueHandle_t s_resume_q;
+
+// Reload generations (spec 2026-10-05 §3.5): every queued message and armed sleep slot carries the
+// generation it was made in, and a reload starts a new one, so TaskLua drops the old state's resumes,
+// events and runs as they arrive. A resume of an old registry ref into the new state would release a
+// slot some new object holds.
+static std::atomic<uint32_t> s_gen{1};
+
+// The last finished reload, for lua_engine_reload() to wait on (a 1-item queue, overwritten).
+typedef struct { uint32_t seq; uint16_t loaded; uint16_t total; } ReloadDone;
+static QueueHandle_t         s_reload_done;
+static std::atomic<uint32_t> s_reload_seq{0};
 
 // ── Counters (published via metrics + public API) ─────────────────────
 static std::atomic<std::uint_fast16_t> s_live_coroutines;
@@ -276,8 +297,10 @@ extern "C" void lua_scheduler_yield_bump(void) {
 static void on_timer_fire(void* arg) {
     TimerSlot* slot = (TimerSlot*)arg;
     if (!slot || !slot->in_use.load(std::memory_order_acquire)) return;
+    const uint32_t gen = slot->gen;
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
+    m.gen                  = gen;
     m.resume.coroutine_ref = slot->coroutine_ref;
     // Runs on the esp_timer TASK (dispatch_method = ESP_TIMER_TASK above), not
     // an ISR — a plain xQueueSend is correct (the old xQueueSendFromISR was a
@@ -294,11 +317,15 @@ static void on_timer_fire(void* arg) {
         // new ref and then this store would clobber it back to -1,
         // orphaning the freshly-parked coroutine. Ref-then-flag closes
         // the window (the slot isn't claimable until in_use is false).
-        slot->coroutine_ref = -1;
-        // release: publishes the coroutine_ref=-1 store above before another
-        // core can observe the slot as free (enforces the ref-then-flag order
-        // the comment above intends — plain stores let the CPU reorder them).
-        slot->in_use.store(false, std::memory_order_release);
+        // A reload in between freed the slot and a new sleep may own it now
+        // (another generation): leave that one alone.
+        if (slot->gen == gen) {
+            slot->coroutine_ref = -1;
+            // release: publishes the coroutine_ref=-1 store above before another
+            // core can observe the slot as free (enforces the ref-then-flag order
+            // the comment above intends — plain stores let the CPU reorder them).
+            slot->in_use.store(false, std::memory_order_release);
+        }
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
@@ -324,6 +351,7 @@ static TimerSlot* slot_acquire(int coroutine_ref) {
         if (!s_timer_pool[i].in_use.load(std::memory_order_acquire)) {
             s_timer_pool[i].in_use.store(true, std::memory_order_relaxed);
             s_timer_pool[i].coroutine_ref = coroutine_ref;
+            s_timer_pool[i].gen = s_gen.load(std::memory_order_relaxed);
             if (!s_timer_pool[i].handle) {
                 const esp_timer_create_args_t args = {
                     .callback         = on_timer_fire,
@@ -358,6 +386,7 @@ extern "C" bool lua_scheduler_push_resume(int coroutine_ref) {
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
     m.resume.coroutine_ref = coroutine_ref;
+    m.gen                  = s_gen.load(std::memory_order_relaxed);
     bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
@@ -374,6 +403,7 @@ extern "C" bool lua_scheduler_push_run_named(const char* name,
     if (!name) return false;
     LuaMsg m = {};
     m.kind = MSG_RUN_NAMED;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     std::strncpy(m.named.name, name, sizeof(m.named.name) - 1);
     if (args) {
         if (args->value)
@@ -400,6 +430,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
                                            const void* payload_96) {
     LuaMsg m = {};
     m.kind = MSG_EVENT;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     m.event.kind = (LuaEventKind)event_kind;
     if (payload_96) {
         memcpy(m.event.payload, payload_96, 96);
@@ -422,6 +453,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
 extern "C" bool lua_scheduler_push_load_all(void) {
     LuaMsg m = {};
     m.kind = MSG_LOAD_ALL;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
@@ -838,7 +870,7 @@ static bool load_one_script(lua_State* L, const char* name) {
 // Iterate the SPIFFS script cache, compile + start each entry. A bad
 // script is logged and skipped, NEVER allowed to abort the loop — one
 // broken file must not take the rest down or boot-loop the node.
-static void load_all_scripts(lua_State* L) {
+static void load_all_scripts(lua_State* L, uint16_t* loaded_out, uint16_t* total_out) {
     LuaScriptEntry entries[LUA_SCRIPT_MAX];
     const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
     uint16_t loaded = 0;
@@ -846,6 +878,8 @@ static void load_all_scripts(lua_State* L) {
         if (load_one_script(L, entries[i].name)) loaded++;
     }
     ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
+    if (loaded_out) *loaded_out = loaded;
+    if (total_out) *total_out = n;
 }
 
 // zhac.on_cron(expr, fn): entries carry a parsed CronExpr (`c`). Checked
@@ -881,8 +915,65 @@ static void cron_tick(lua_State* L) {
     last = now;
 }
 
+// MSG_RELOAD (spec 2026-10-05 §3.5), on TaskLua — the only task that touches the VM. Rules are not
+// touched; script state (globals, pending zhac.sleep) is lost on purpose; settings a script gave tg_gw stay.
+// noinline: inlined, its LuaScriptEntry array joins task_lua's frame, which every message pays on TaskLua's
+// 8 KB stack (S31, -O2: task_lua 992 B before reload, 1168 B with it inlined, 640 B this way).
+[[gnu::noinline]] static void reload_engine(uint32_t seq) {
+    // 1. Stop every sleep timer and free the pool.
+    for (TimerSlot& s : s_timer_pool) {
+        if (s.handle) esp_timer_stop(s.handle);   // ESP_ERR_INVALID_STATE when it was not armed: fine
+        s.coroutine_ref = -1;
+        s.in_use.store(false, std::memory_order_release);
+    }
+    // 2. A new generation: what the old state queued is dropped as it arrives.
+    s_gen.fetch_add(1, std::memory_order_relaxed);
+    // 3. Close the state; every coroutine goes with it.
+    if (g_L) lua_close(g_L);
+    g_L = nullptr;
+    s_live_coroutines.store(0);
+    _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)0);
+    // 4. A fresh state, built as at boot. 5. Every stored script, as at boot; on_boot is not called again.
+    ReloadDone done{seq, 0, 0};
+    g_L = lua_engine_new_state(lua_panic_handler);
+    if (g_L) {
+        load_all_scripts(g_L, &done.loaded, &done.total);
+    } else {
+        LuaScriptEntry entries[LUA_SCRIPT_MAX];
+        done.total = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
+        ESP_LOGE(TAG, "reload: no new Lua state (out of memory?) -- scripts stay off until the next reload");
+    }
+    ESP_LOGI(TAG, "lua reload: %u/%u scripts started", done.loaded, done.total);
+    if (s_reload_done) xQueueOverwrite(s_reload_done, &done);
+}
+
+extern "C" LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total) {
+    if (!s_resume_q || !s_reload_done) return LUA_RELOAD_BUSY;
+    LuaMsg m = {};
+    m.kind = MSG_RELOAD;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
+    m.reload.seq = s_reload_seq.fetch_add(1) + 1;
+    if (xQueueSend(s_resume_q, &m, 0) != pdTRUE) {
+        _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+        return LUA_RELOAD_BUSY;
+    }
+    // ponytail: two callers reloading at once share the 1-item result queue; one of them may miss its
+    // result and answer "queued" while the pass still completes. A per-call result slot if that matters.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t span  = pdMS_TO_TICKS(wait_ms);
+    ReloadDone d{};
+    for (;;) {
+        const TickType_t spent = xTaskGetTickCount() - start;
+        if (spent >= span || xQueueReceive(s_reload_done, &d, span - spent) != pdTRUE) return LUA_RELOAD_QUEUED;
+        if (d.seq == m.reload.seq) break;   // an earlier, abandoned call's result: drop it, keep waiting
+    }
+    if (loaded) *loaded = d.loaded;
+    if (total) *total = d.total;
+    return LUA_RELOAD_DONE;
+}
+
 static void task_lua(void* arg) {
-    lua_State* L = (lua_State*)arg;
+    (void)arg;   // the state is g_L, which a reload replaces
     ESP_LOGI(TAG, "TaskLua started");
     // T20: real watchdog coverage. esp_task_wdt_add(NULL) subscribes
     // THIS task; the loop resets it every iteration. The receive timeout
@@ -912,26 +1003,31 @@ static void task_lua(void* arg) {
             // CODEX M-03: the longjmp skipped resume_and_settle. Reclaim any
             // coroutine still in flight so its registry ref + live-count slot
             // don't leak (a repeated raise would otherwise exhaust the pool).
-            if (s_inflight.ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, s_inflight.ref);
-            if (s_inflight.counted)          lua_scheduler_coroutine_exit();
+            if (g_L && s_inflight.ref != LUA_NOREF) luaL_unref(g_L, LUA_REGISTRYINDEX, s_inflight.ref);
+            if (s_inflight.counted)                 lua_scheduler_coroutine_exit();
             s_inflight = {};
             continue;
         }
         s_panic_armed = true;
         s_inflight = {};   // CODEX M-03: clean slate for this dispatch step
 
-        cron_tick(L);
+        lua_State* L = g_L;   // read every step: MSG_RELOAD replaces it (NULL after a reload that failed)
+        if (L) cron_tick(L);
         if (!got) { s_panic_armed = false; continue; }
 
-        if (m.kind == MSG_RESUME) {
-            resume_coroutine(L, &m.resume);
-        } else if (m.kind == MSG_EVENT) {
-            dispatch_event(L, &m.event);
-        } else if (m.kind == MSG_RUN_NAMED) {
-            run_named_script(L, &m.named);
-        } else if (m.kind == MSG_LOAD_ALL) {
-            load_all_scripts(L);
-        }
+        if (m.kind == MSG_RELOAD) {
+            reload_engine(m.reload.seq);
+        } else if (L && m.gen == s_gen.load(std::memory_order_relaxed)) {
+            if (m.kind == MSG_RESUME) {
+                resume_coroutine(L, &m.resume);
+            } else if (m.kind == MSG_EVENT) {
+                dispatch_event(L, &m.event);
+            } else if (m.kind == MSG_RUN_NAMED) {
+                run_named_script(L, &m.named);
+            } else if (m.kind == MSG_LOAD_ALL) {
+                load_all_scripts(L, nullptr, nullptr);
+            }
+        }   // else: the old state's message (a reload came after it), or no engine: dropped
 
         s_panic_armed = false;
     }
@@ -966,6 +1062,13 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
         ESP_LOGE(TAG, "resume queue create failed");
         return false;
     }
+    s_reload_done = xQueueCreate(1, sizeof(ReloadDone));
+    if (!s_reload_done) {
+        ESP_LOGE(TAG, "reload queue create failed");
+        zhac_queue_delete(s_resume_q);
+        s_resume_q = NULL;
+        return false;
+    }
 
     // T20: route VM panics (unprotected raises — OOM at the budget cap,
     // internal errors) through our handler so they unwind to task_lua's
@@ -981,6 +1084,8 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
         ESP_LOGE(TAG, "TaskLua create failed");
         zhac_queue_delete(s_resume_q);
         s_resume_q = NULL;
+        vQueueDelete(s_reload_done);   // plain xQueueCreate above, so a plain delete
+        s_reload_done = NULL;
         return false;
     }
     return true;

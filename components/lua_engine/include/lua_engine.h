@@ -62,6 +62,17 @@ bool lua_engine_check_syntax(const char* name, const char* src,
 typedef void (*LuaErrorHook)(const char* name, int line, const char* message);
 void lua_engine_set_error_hook(LuaErrorHook hook);
 
+// script.reload (spec 2026-10-05 §3.5): on TaskLua, stops every sleep timer, drops the old state's queued
+// resumes, events and runs, closes the Lua state, opens a fresh one as lua_engine_init does (no new task,
+// queue, event bridge or rules hook) and loads every stored script as at boot -- on_boot handlers are not
+// called again. Rules are not touched; script state (globals, pending zhac.sleep) is lost on purpose.
+// Waits up to `wait_ms`:
+//   LUA_RELOAD_DONE   -- finished; *loaded of *total scripts started;
+//   LUA_RELOAD_QUEUED -- still running after wait_ms (it finishes anyway);
+//   LUA_RELOAD_BUSY   -- TaskLua's queue is full; nothing was asked.
+typedef enum { LUA_RELOAD_DONE = 0, LUA_RELOAD_QUEUED = 1, LUA_RELOAD_BUSY = 2 } LuaReloadResult;
+LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total);
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,30 +17,39 @@ static const char* TAG = "lua_engine";
 
 lua_State* g_L = NULL;
 
-bool lua_engine_init(void) {
-    if (g_L) return true;
-
+lua_State* lua_engine_new_state(lua_CFunction panic) {
     // Lua 5.5 adds a seed arg to randomise string hashing; 0 is fine
     // for our single-state embedded use.
-    g_L = lua_newstate(lua_engine_alloc, NULL, 0);
-    if (!g_L) {
+    lua_State* L = lua_newstate(lua_engine_alloc, NULL, 0);
+    if (!L) {
         ESP_LOGE(TAG, "lua_newstate failed — out of memory?");
-        return false;
+        return NULL;
     }
+    if (panic) lua_atpanic(L, panic);
 
     // Load the standard libs (we'll redact the unsafe bits in the
     // sandbox pass). Lua's `luaL_openlibs` registers base / table /
     // string / math / io / os / coroutine / debug / package.
-    luaL_openlibs(g_L);
+    luaL_openlibs(L);
 
-    if (!lua_engine_sandbox_apply(g_L)) {
+    if (!lua_engine_sandbox_apply(L)) {
         ESP_LOGE(TAG, "sandbox apply failed");
-        goto fail;
+        lua_close(L);
+        return NULL;
     }
-    if (!lua_engine_require_install(g_L)) {
+    if (!lua_engine_require_install(L)) {
         ESP_LOGE(TAG, "require install failed");
-        goto fail;
+        lua_close(L);
+        return NULL;
     }
+    return L;
+}
+
+bool lua_engine_init(void) {
+    if (g_L) return true;
+
+    g_L = lua_engine_new_state(NULL);
+    if (!g_L) return false;
     if (!lua_engine_scheduler_start(g_L)) {
         ESP_LOGE(TAG, "scheduler start failed");
         goto fail;
@@ -175,6 +184,12 @@ bool     lua_engine_check_syntax(const char* n, const char* s,
     return true;   // engine disabled → no syntax checks, pretend OK
 }
 void     lua_engine_set_error_hook(LuaErrorHook hook) { (void)hook; }
+LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total) {
+    (void)wait_ms;
+    if (loaded) *loaded = 0;
+    if (total) *total = 0;
+    return LUA_RELOAD_DONE;
+}
 size_t   lua_engine_heap_used_bytes(void)  { return 0; }
 size_t   lua_engine_heap_peak_bytes(void)  { return 0; }
 uint16_t lua_engine_live_coroutines(void)  { return 0; }

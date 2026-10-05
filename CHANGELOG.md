@@ -10,6 +10,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 ### Added
 
 - **`lua_engine_set_error_hook(fn(name, line, message))`** (`lua_engine`, spec 2026-10-05 §3.6): called on TaskLua where script errors are logged (compile at load, reload or run; an error while running), with the script's name and line from Lua's `[string "<name>"]:<line>:` prefix and the text cut to 120 bytes on a character boundary; at most once per script per 10 s. The wired firmware turns it into the `script.error` event. Pure parts in `include/lua_engine_err.h`, host test `test/host/lua_err_test.cpp`.
+- **`lua_engine_reload(wait_ms, &loaded, &total)`** (`lua_engine`, spec 2026-10-05 §3.5): restarts the Lua engine without a reboot -- on TaskLua it stops every sleep timer, drops the old state's queued resumes, events and runs (a generation number on messages and timer slots), closes the state, opens a fresh one as at boot and loads every stored script (on_boot is not called again). Waits up to `wait_ms` (`LUA_RELOAD_DONE`), else `LUA_RELOAD_QUEUED`. `LuaScriptEntry` gains `mtime`.
 
 ### Changed
 
@@ -30,6 +31,7 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **A 23- or 24-character script name could not be saved**: the temp file was `/<name>.lua.tmp`, longer than SPIFFS's 31-character object names; it is now `/<name>.tmp`.
 - **Lua `zhac.on_mqtt(topic, fn)`, `zhac.on_attr_change(ieee, key, fn)` and `zhac.on_cron(expr, fn)` work as documented.** Registration only accepted a bare function, so the documented forms raised "bad argument #1" and the script failed to load; `on_cron` handlers were stored but never called (no cron dispatch existed). Filters are now checked before a handler coroutine starts (exact topic; IEEE with or without `0x`, any case; key or `"*"`; `nil` = any), and TaskLua evaluates cron expressions once per second on the local clock (5- or 6-field; invalid ones are a registration error). The bare-function forms still receive every event; `on_cron(fn)` alone is ignored with a warning.
 - **`TaskEventBus` no longer burns a fifth of core 0 while idle**: the pump sleeps until a
   publish instead of polling every 20 ms (shared `event_bus_pump_run`).

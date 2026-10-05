@@ -119,7 +119,11 @@ extern "C" uint16_t lua_script_cache_list(LuaScriptEntry* out, uint16_t max) {
         char path[BASE_PATH_MAX];
         std::snprintf(path, sizeof(path), "%s/%s", BASE_PATH, fname);
         struct stat st;
-        out[count].size = (stat(path, &st) == 0) ? (uint16_t)st.st_size : 0;
+        const bool have = stat(path, &st) == 0;
+        out[count].size  = have ? (uint16_t)st.st_size : 0;
+        // SPIFFS keeps the time of the last write (CONFIG_SPIFFS_USE_MTIME): a real date only when the
+        // hub's clock was set then; callers drop values under 1,600,000,000.
+        out[count].mtime = have ? (uint32_t)st.st_mtime : 0;
         count++;
     }
     closedir(d);
@@ -171,9 +175,12 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
         return false;
     }
 
-    char path[96], tmp[104];
+    // The temp file is /<name>.tmp, not /<name>.lua.tmp: SPIFFS object names hold at most 31 characters
+    // (CONFIG_SPIFFS_OBJ_NAME_LEN=32 with the NUL), so a 23- or 24-character name could not be saved
+    // (spec 2026-10-05 §3.8). list/count only look at *.lua, so a leftover .tmp is never a script.
+    char path[96], tmp[96];
     if (!build_path(path, sizeof(path), name)) return false;
-    const int n = std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    const int n = std::snprintf(tmp, sizeof(tmp), "%s/%s.tmp", BASE_PATH, name);
     if (n <= 0 || (size_t)n >= sizeof(tmp)) return false;
 
     FILE* fp = std::fopen(tmp, "w");

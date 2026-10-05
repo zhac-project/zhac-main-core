@@ -16,7 +16,8 @@
 extern "C" {
 #endif
 
-// The single master state. Created once in lua_engine_init().
+// The single master state. Created in lua_engine_init(); script.reload replaces it (on TaskLua), and it is
+// NULL after a reload that found no memory for a new one.
 extern lua_State* g_L;
 
 // Kick-off helpers invoked by lua_engine_init(). Each returns false
@@ -24,6 +25,10 @@ extern lua_State* g_L;
 bool lua_engine_sandbox_apply(lua_State* L);
 bool lua_engine_require_install(lua_State* L);
 bool lua_engine_scheduler_start(lua_State* L);
+// A fresh lua_State with the custom allocator, the libraries, the sandbox and `require`, as boot and
+// script.reload both need it. `panic` (may be NULL) is installed before the libraries load, so an
+// allocation failure there unwinds to TaskLua's panic frame instead of aborting. NULL on failure.
+lua_State* lua_engine_new_state(lua_CFunction panic);
 void lua_engine_scheduler_stop(void);
 
 // Native module loader entry points — called by lua_engine_require_install
