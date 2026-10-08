@@ -81,6 +81,8 @@ LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* 
 // completes, or a clean boot (power-on, software restart).
 // Any task.
 const char* lua_engine_scripts_held(void);
+// What a run request answers while the scripts are held (TaskLua skips it).
+#define LUA_ENGINE_HELD_ERR "scripts are held: the hub restarted twice while scripts were starting; Apply starts them again"
 
 #ifdef __cplusplus
 }

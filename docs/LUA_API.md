@@ -1190,11 +1190,15 @@ one of cjson's nesting errors.
 Cause: TaskLua's C stack is bounded, so Lua is too: at most 16 nested
 levels of C calls and parser nesting (`pcall`, `string.gsub` callbacks,
 metamethods, nested functions, tables and parentheses; `LUAI_MAXCCALLS`
-in `components/lua_engine/lua_limits.cmake`), 32 nested pattern items,
-16 levels of JSON. The 32 KB stack
-(`CONFIG_LUA_ENGINE_TASK_STACK_BYTES`) holds the deepest of these, so
-a script that goes deeper gets a Lua error instead of crashing the hub.
-Ordinary scripts need 5 to 10 levels.
+in `components/lua_engine/lua_limits.cmake`), 16 levels of JSON, and
+32 levels of pattern-matching recursion (`MAXCCALLS`): past that a
+pattern fails with `pattern too complex`. In a pattern, each optional
+item (`a?`) or repetition costs about one level and each quantified
+capture such as `(%d+)` three, so about 10 such captures fit (an
+ISO date and time, 6 captures, matches); plain characters cost nothing.
+The 32 KB stack (`CONFIG_LUA_ENGINE_TASK_STACK_BYTES`) holds the
+deepest of these, so a script that goes deeper gets a Lua error instead
+of crashing the hub. Ordinary scripts need 5 to 10 nesting levels.
 
 Fix: flatten the recursion (a loop, or more coroutines via
 `zhac.on_*`), split long patterns, flatten the JSON. If the hub still

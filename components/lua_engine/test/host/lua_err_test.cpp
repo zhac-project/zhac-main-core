@@ -3,6 +3,7 @@
 //
 // script.error reports (spec 2026-10-05 §3.6).
 #include "lua_engine_err.h"
+#include "lua_engine_guard.h"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -139,6 +140,14 @@ int main() {
     uint32_t s = lua_guard_count(0, false, false);
     for (int i = 0; i < 300; i++) s = lua_guard_count(s, true, true);
     assert(lua_guard_held(s) && lua_guard_held(lua_guard_count(s, true, true)));   // no wrap back to 0
+
+    // Which resets count: a panic and the watchdogs; power-on, a software restart (Restart, an OTA), a brownout
+    // and the rest are clean boots.
+    for (esp_reset_reason_t r : {ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT}) assert(lua_guard_crashed(r));
+    assert(lua_guard_crashed(ESP_RST_CPU_LOCKUP));   // a double exception on RISC-V: a crash loop can end in one
+    for (esp_reset_reason_t r : {ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_DEEPSLEEP,
+                                 ESP_RST_BROWNOUT, ESP_RST_SDIO, ESP_RST_USB, ESP_RST_JTAG, ESP_RST_EFUSE, ESP_RST_PWR_GLITCH})
+        assert(!lua_guard_crashed(r));
     std::printf("lua_err_tests: ok\n");
     return 0;
 }

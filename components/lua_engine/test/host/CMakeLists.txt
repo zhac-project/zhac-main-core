@@ -12,9 +12,9 @@ add_compile_options(-Wall -Wextra -Werror)
 
 enable_testing()
 
-# script.error reports: Lua's prefix parsed, the message cut, one event per script per 10 s
+# script.error reports (Lua's prefix parsed, the message cut, the rate gate) and the boot-loop guard's pure parts
 add_executable(lua_err_tests lua_err_test.cpp)
-target_include_directories(lua_err_tests PRIVATE ../../include)
+target_include_directories(lua_err_tests PRIVATE ../../include ../../src stubs)   # stubs: esp_system.h (reset reasons)
 add_test(NAME lua_err COMMAND lua_err_tests)
 
 # The Lua C-stack limits: the vendored Lua 5.5 (managed_components/georgik__lua, which an IDF configure of this

@@ -53,19 +53,6 @@ inline void lua_err_parse(const char* msg, const char* ctx_name, LuaErrInfo* out
     out->message[n] = '\0';
 }
 
-// The boot-loop guard's count (lua_scheduler.cpp keeps it in no-init RAM, so it is garbage after power-on):
-// the unexpected resets in a row that found the guard armed, tagged so garbage reads as 0. `crashed` = this
-// boot follows a panic or a watchdog reset, `armed` = the scripts were starting when it happened. Two in a
-// row hold the scripts; it saturates rather than wrapping back to 0.
-constexpr uint32_t kLuaGuardTag    = 0x4C434E00u;   // "LCN" + the count in the low byte
-constexpr uint32_t kLuaGuardHoldAt = 2;
-inline uint32_t lua_guard_count(uint32_t stored, bool crashed, bool armed) {
-    uint32_t n = (stored & 0xFFFFFF00u) == kLuaGuardTag ? (stored & 0xFFu) : 0;
-    n = (crashed && armed) ? (n < 0xFFu ? n + 1 : n) : 0;
-    return kLuaGuardTag | n;
-}
-inline bool lua_guard_held(uint32_t count) { return (count & 0xFFu) >= kLuaGuardHoldAt; }
-
 // A name a stored script could have: [A-Za-z0-9_-]{1,24} (lua_script_cache's rule, remote_script_name_ok).
 inline bool lua_err_name_ok(const char* s) {
     size_t n = 0;

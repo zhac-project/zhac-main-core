@@ -44,6 +44,7 @@ extern "C" {
 }
 #include "metrics/metrics_macros.h"
 #include "lua_engine_err.h"
+#include "lua_engine_guard.h"   // the boot-loop guard's pure parts (host-tested)
 // T20: derive the ZclAttrEvent payload layout from the canonical schema
 // constants instead of hardcoded offsets. event_bus schema v6 widened
 // ATTR_KEY_MAX 20→28, which slid the value union from offset 36 to 44;
@@ -101,7 +102,7 @@ static LuaErrGate                s_err_gate;   // TaskLua only
 // logged, reported (lua_engine_scripts_held(), and script.error every minute while it lasts) and ends
 // with a reload that completes (Apply) or a clean boot.
 static __NOINIT_ATTR uint32_t s_guard_mark;
-static __NOINIT_ATTR uint32_t s_guard_crashes;     // lua_guard_count() (lua_engine_err.h, host-tested)
+static __NOINIT_ATTR uint32_t s_guard_crashes;     // lua_guard_count() (lua_engine_guard.h, host-tested)
 static __NOINIT_ATTR char     s_guard_script[25];  // the script loading when it was armed, else ""
 static constexpr uint32_t kGuardArmed  = 0x4C554147;   // "LUAG"
 static constexpr int      kGuardWindowS = 60;
@@ -111,8 +112,7 @@ static esp_timer_handle_t s_guard_timer;
 
 // At boot, before TaskLua runs: count this reset and decide whether to hold the scripts.
 static void guard_boot_check() {
-    const esp_reset_reason_t r = esp_reset_reason();
-    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    const bool crashed = lua_guard_crashed(esp_reset_reason());
     s_guard_crashes = lua_guard_count(s_guard_crashes, crashed, s_guard_mark == kGuardArmed);
     s_guard_mark = 0;
     s_guard_script[sizeof(s_guard_script) - 1] = '\0';   // garbage after power-on; only read when held
