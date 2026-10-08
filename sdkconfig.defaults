@@ -41,3 +41,7 @@ CONFIG_ZHAC_P4_RESET_BTN_GPIO=35
 # s_rsp_buf) — only safe on non-DMA, non-ISR paths.
 CONFIG_SPIRAM_RODATA=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# TaskLua at 32 KB, internal RAM on this build: the Lua C-stack limits (components/lua_engine/lua_limits.cmake,
+# LUAI_MAXCCALLS=16) are sized for it. 8 KB let a few levels of pcall or gsub recursion overflow the stack.
+CONFIG_LUA_ENGINE_TASK_STACK_BYTES=32768

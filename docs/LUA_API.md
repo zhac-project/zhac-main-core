@@ -49,7 +49,7 @@ one-way link into them via the `zhac.*` module.
   blocked — all `require`/`load` paths use `mode="t"` (text only).
   See §6. Implementation: `components/lua_engine/src/lua_sandbox.c`.
 - **Cooperative scheduling.** All Lua execution runs on one FreeRTOS
-  task (`TaskLua`, priority 4, 8 KB stack by default). Scripts yield
+  task (`TaskLua`, priority 4, a 32 KB stack on the wired and P4 builds). Scripts yield
   via `zhac.sleep(ms)`; no preemption. Implementation:
   `components/lua_engine/src/lua_scheduler.cpp`.
 - **Hard memory budget.** Default 4 MB total Lua heap (tunable via
@@ -995,8 +995,10 @@ Notes:
 - `cjson.null` is the sentinel for JSON `null`. Test with
   `value == cjson.null`, not `value == nil`, when you need to
   distinguish "key missing" from "key present but null".
-- Decode depth is capped at 64 (see `CONFIG_LUA_ENGINE_CJSON_DECODE_MAX_DEPTH`).
-  Deeper payloads raise `"found too many nested data structures"`.
+- Encode and decode nesting are capped at 16 levels, and a script cannot
+  change that: `cjson.encode_max_depth`, `cjson.decode_max_depth` and
+  `cjson.new` are removed. Deeper payloads raise `"found too many nested
+  data structures"`, deeper tables `"Cannot serialise, excessive nesting"`.
 
 ### 10.6 Publish a JSON state snapshot on cron
 
@@ -1180,17 +1182,24 @@ the old version already installed.
 Fix: reboot the P4 core. The next `lua_engine_load_all` brings up a
 fresh state with only the current sources.
 
-### TaskLua stack overflow
+### Deep nesting and recursion
 
-Symptom: a panic with "TaskLua" in the backtrace, or a FreeRTOS
-stack-overflow notification.
+Symptom: a script error `C stack overflow`, `pattern too complex`, or
+one of cjson's nesting errors.
 
-Cause: deeply nested Lua calls in a handler. Default stack is 8 KB
-(`CONFIG_LUA_ENGINE_TASK_STACK_BYTES`).
+Cause: TaskLua's C stack is bounded, so Lua is too: at most 16 nested
+levels of C calls and parser nesting (`pcall`, `string.gsub` callbacks,
+metamethods, nested functions, tables and parentheses; `LUAI_MAXCCALLS`
+in `components/lua_engine/lua_limits.cmake`), 32 nested pattern items,
+16 levels of JSON. The 32 KB stack
+(`CONFIG_LUA_ENGINE_TASK_STACK_BYTES`) holds the deepest of these, so
+a script that goes deeper gets a Lua error instead of crashing the hub.
+Ordinary scripts need 5 to 10 levels.
 
-Fix: raise the Kconfig value (bounded at 32 KB) and rebuild. Or
-reduce handler depth / move work into multiple coroutines via
-`zhac.on_*`.
+Fix: flatten the recursion (a loop, or more coroutines via
+`zhac.on_*`), split long patterns, flatten the JSON. If the hub still
+restarts while its scripts start, after two restarts in a row it holds
+them (status `scripts_held`): fix or delete the script, then Apply.
 
 ---
 
@@ -1239,11 +1248,12 @@ surface.
   encode/decode from openresty/lua-cjson 2.1.0.14, vendored under
   `components/lua_cjson/src/`. `require "cjson"` returns the module;
   `cjson.encode(tbl)` / `cjson.decode(str)` are the core entry points.
-  Decode-depth cap is set at init from
-  `CONFIG_LUA_ENGINE_CJSON_DECODE_MAX_DEPTH` (default 64) to harden
-  against stack blow-ups on attacker-controlled payloads. See
+  Encode and decode nesting are capped at 16 at init, and the depth
+  setters and `cjson.new` are removed, so neither a script nor a payload
+  can overflow TaskLua's C stack. See
   [lua-cjson manual](https://github.com/openresty/lua-cjson) for the
-  full API (`encode_sparse_array`, `encode_max_depth`, `null`, etc.).
+  full API (`encode_sparse_array`, `null`, etc.; `encode_max_depth`,
+  `decode_max_depth` and `new` are not available here).
 
 **Off-by-default** — flip the Kconfig flag, drop the sources under
 `components/<module>/`, rebuild:
