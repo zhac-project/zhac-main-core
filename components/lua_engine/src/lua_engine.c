@@ -85,6 +85,9 @@ uint32_t lua_engine_yield_count(void)      { return lua_scheduler_yield_count();
 
 void lua_engine_load_all(void) {
     if (!g_L) return;
+    // The boot-loop guard (lua_scheduler.cpp) held the scripts: it logged why, and reports it until a
+    // reload completes or the hub boots cleanly.
+    if (lua_engine_scripts_held()) return;
     // Compiling + spawning here — on the caller's task — raced TaskLua,
     // which may already be resuming previously spawned coroutines on the
     // same g_L (the first script's spawn pushes an immediate resume).
@@ -133,8 +136,10 @@ bool lua_engine_check_syntax(const char* name, const char* src,
     const size_t slen = strlen(src);
     const char* chunkname = (name && name[0]) ? name : "check";
 
-    // Fresh state — default allocator is system heap. ~4 KB transient.
-    lua_State* L = luaL_newstate();
+    // Fresh state on the engine's allocator (PSRAM-aware, thread-safe counters): the system allocator put
+    // tens of KB of small blocks in internal DRAM for a 16 KB text (SPIRAM_MALLOC_ALWAYSINTERNAL), the
+    // S31's tight resource, on every cloud check and save. Transient; charged to the engine's budget.
+    lua_State* L = lua_newstate(lua_engine_alloc, NULL, 0);
     if (!L) {
         if (err_out && err_cap) strncpy(err_out, "out of memory", err_cap - 1);
         if (line_out) *line_out = 1;
@@ -184,6 +189,7 @@ bool     lua_engine_check_syntax(const char* n, const char* s,
     return true;   // engine disabled → no syntax checks, pretend OK
 }
 void     lua_engine_set_error_hook(LuaErrorHook hook) { (void)hook; }
+const char* lua_engine_scripts_held(void)  { return NULL; }
 LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total) {
     (void)wait_ms;
     if (loaded) *loaded = 0;

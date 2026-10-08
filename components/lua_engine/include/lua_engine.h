@@ -73,6 +73,15 @@ void lua_engine_set_error_hook(LuaErrorHook hook);
 typedef enum { LUA_RELOAD_DONE = 0, LUA_RELOAD_QUEUED = 1, LUA_RELOAD_BUSY = 2 } LuaReloadResult;
 LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total);
 
+// The boot-loop guard: NULL while scripts run normally. After two unexpected resets in a row (panic,
+// watchdog) that hit the scripts starting (a load pass, boot or reload, or the minute after it), the boot
+// does not load them and this returns the name of the script that was loading at the last crash, or ""
+// when the crash came after the pass. Named runs (a rule's script.run action, Run) are skipped too. Logged
+// at boot and raised as script.error once a minute while it lasts; ends with a script.reload that
+// completes, or a clean boot (power-on, software restart).
+// Any task.
+const char* lua_engine_scripts_held(void);
+
 #ifdef __cplusplus
 }
 #endif

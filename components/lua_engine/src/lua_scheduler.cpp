@@ -19,10 +19,13 @@
 #include <atomic>
 #include <csetjmp>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <strings.h>
 
+#include "esp_attr.h"     // __NOINIT_ATTR: the boot-loop guard
+#include "esp_system.h"   // esp_reset_reason
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
@@ -88,16 +91,88 @@ static InFlightCo s_inflight;
 static std::atomic<LuaErrorHook> s_error_hook{nullptr};
 static LuaErrGate                s_err_gate;   // TaskLua only
 
+// ── Boot-loop guard (final fix wave, I-2(b)) ──────────────────────────
+// A stored script that crashes the hub (C stack, a binding bug, a watchdog during a long load) crashes it
+// again at every boot, and a hub that never stays up cannot be fixed over the network. No-init RAM
+// survives a panic or watchdog reset but not a power cycle (esp_zigbee_backend's radio guard works the
+// same way). s_guard_mark is armed while TaskLua loads the scripts (boot or reload) and for kGuardWindowS
+// after, so on_boot handlers and the first events count too; s_guard_crashes counts the unexpected resets
+// in a row that found it armed. From two on, lua_engine_load_all does not load the scripts: the hold is
+// logged, reported (lua_engine_scripts_held(), and script.error every minute while it lasts) and ends
+// with a reload that completes (Apply) or a clean boot.
+static __NOINIT_ATTR uint32_t s_guard_mark;
+static __NOINIT_ATTR uint32_t s_guard_crashes;     // lua_guard_count() (lua_engine_err.h, host-tested)
+static __NOINIT_ATTR char     s_guard_script[25];  // the script loading when it was armed, else ""
+static constexpr uint32_t kGuardArmed  = 0x4C554147;   // "LUAG"
+static constexpr int      kGuardWindowS = 60;
+static std::atomic<bool>  s_held{false};
+static char               s_held_script[25];   // copied from s_guard_script at boot; "" when unknown
+static esp_timer_handle_t s_guard_timer;
+
+// At boot, before TaskLua runs: count this reset and decide whether to hold the scripts.
+static void guard_boot_check() {
+    const esp_reset_reason_t r = esp_reset_reason();
+    const bool crashed = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    s_guard_crashes = lua_guard_count(s_guard_crashes, crashed, s_guard_mark == kGuardArmed);
+    s_guard_mark = 0;
+    s_guard_script[sizeof(s_guard_script) - 1] = '\0';   // garbage after power-on; only read when held
+    if (!lua_guard_held(s_guard_crashes)) return;
+    if (lua_err_name_ok(s_guard_script)) std::memcpy(s_held_script, s_guard_script, sizeof(s_held_script));
+    s_held = true;
+    ESP_LOGE(TAG, "the hub restarted %u times in a row while scripts were starting (last: '%s') -- scripts NOT "
+                  "started this boot; fix or delete the script, then Apply (script.reload)",
+             static_cast<unsigned>(s_guard_crashes & 0xFFu), s_held_script);
+}
+
+// TaskLua: armed for a load pass; `script` is the one loading now ("" after the pass). Stops the window
+// timer of an earlier pass, which would otherwise disarm this one halfway.
+static void guard_arm(const char* script) {
+    if (s_guard_timer) esp_timer_stop(s_guard_timer);   // ESP_ERR_INVALID_STATE when not running: fine
+    std::snprintf(s_guard_script, sizeof(s_guard_script), "%.24s", script);
+    s_guard_mark = kGuardArmed;
+}
+
+// After a load pass: still armed for kGuardWindowS, then cleared by the timer (esp_timer task).
+static void guard_window() {
+    if (!s_guard_timer) {
+        esp_timer_create_args_t args{};
+        args.callback = [](void*) { s_guard_mark = 0; };
+        args.name     = "lua_boot_guard";
+        if (esp_timer_create(&args, &s_guard_timer) != ESP_OK) { s_guard_mark = 0; return; }   // unguarded
+    }
+    esp_timer_start_once(s_guard_timer, static_cast<uint64_t>(kGuardWindowS) * 1000000ULL);
+}
+
+extern "C" const char* lua_engine_scripts_held(void) { return s_held.load() ? s_held_script : nullptr; }
+
+static void report_error(const char* script, const char* msg);
+
+// TaskLua, every step: while the scripts are held, script.error says so once a minute (under the script
+// that was loading, when known). Neither the cloud link nor a hub page is up at boot, and the cloud keeps
+// the last error per script, so one event would be lost.
+static void report_held() {
+    static int64_t last_us = 0;
+    if (!s_held.load()) return;
+    const int64_t now = esp_timer_get_time();
+    if (last_us && now - last_us < 60LL * 1000000) return;
+    last_us = now;
+    report_error(s_held_script[0] ? s_held_script : nullptr,
+                 "not started: the hub restarted twice in a row while scripts were starting; "
+                 "fix or delete the script, then Apply");
+}
+
 extern "C" void lua_engine_set_error_hook(LuaErrorHook hook) { s_error_hook.store(hook); }
 
-// Hands one Lua error (already logged by the caller) to the hook, at most once per script per 10 s.
-// `script`: the script being loaded or run, when the caller knows it.
+// Hands one Lua error (already logged by the caller) to the hook, at most once per script per 10 s and
+// kLuaErrGlobalMax in all. `script`: the script being loaded or run, when the caller knows it. The gate keys
+// on that, else on a name a stored script could have: a forged `[string "<name>"]:` prefix cannot buy
+// more events.
 static void report_error(const char* script, const char* msg) {
     const LuaErrorHook hook = s_error_hook.load();
     if (!hook) return;
     LuaErrInfo e;
     lua_err_parse(msg, script, &e);
-    if (lua_err_gate_due(&s_err_gate, e.name, static_cast<uint32_t>(esp_timer_get_time() / 1000))) {
+    if (lua_err_gate_due(&s_err_gate, lua_err_gate_key(script, e), static_cast<uint32_t>(esp_timer_get_time() / 1000))) {
         hook(e.name, e.line, e.message);
     }
 }
@@ -150,8 +225,13 @@ static void lua_resume_count_hook(lua_State* L, lua_Debug*) {
         s_resume_killed = true;
         lua_sethook(L, lua_resume_count_hook, LUA_MASKCOUNT, 1);
     }
-    luaL_error(L, "lua_engine: resume exceeded %lld us budget",
-               (long long)LUA_RESUME_DEADLINE_US);
+    // Lua 5.5's lua_pushfstring has no %l ("invalid option '%l'" was the whole message), so %I with a
+    // lua_Integer. Level 0, not luaL_error's 1: inside a hook level 0 is the running script, which keeps the
+    // `[string "<name>"]:<line>:` prefix script.error attributes the error by.
+    luaL_where(L, 0);
+    lua_pushfstring(L, "lua_engine: resume exceeded %I us budget", static_cast<lua_Integer>(LUA_RESUME_DEADLINE_US));
+    lua_concat(L, 2);
+    lua_error(L);
 }
 
 static void arm_resume_deadline(lua_State* co) {
@@ -741,6 +821,12 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
 // val_type, int_val, str_val}); fields are zero / "" for non-device
 // triggers. Returns after the coroutine either yields or terminates.
 static void run_named_script(lua_State* L, const RunNamedArgs* r) {
+    // Held by the boot-loop guard: a rule's script.run action (or Run) firing the script that crashed the hub
+    // would crash it again, outside the guard's window, every time the rule fires. Apply ends the hold.
+    if (s_held.load()) {
+        ESP_LOGW(TAG, "script.run '%s' skipped: scripts are held after crashes (Apply starts them)", r->name);
+        return;
+    }
     // Script source scratch lives in PSRAM. Lazy one-shot init. T20:
     // size to LUA_SCRIPT_SRC_MAX (+1 NUL) — the unified store cap — so a
     // legitimately large stored script isn't silently truncated at an 8
@@ -875,8 +961,15 @@ static void load_all_scripts(lua_State* L, uint16_t* loaded_out, uint16_t* total
     const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
     uint16_t loaded = 0;
     for (uint16_t i = 0; i < n; ++i) {
+        // The Task 11 ruling: feed the task watchdog between scripts. Each script's compile and first run is
+        // bounded (the CPU budget), sixteen large ones together are not, and where the watchdog panics
+        // (P4 main-core sets trigger_panic) a long boot load was a boot loop.
+        esp_task_wdt_reset();
+        guard_arm(entries[i].name);
         if (load_one_script(L, entries[i].name)) loaded++;
     }
+    guard_arm("");
+    guard_window();
     ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
     if (loaded_out) *loaded_out = loaded;
     if (total_out) *total_out = n;
@@ -934,10 +1027,16 @@ static void cron_tick(lua_State* L) {
     s_live_coroutines.store(0);
     _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)0);
     // 4. A fresh state, built as at boot. 5. Every stored script, as at boot; on_boot is not called again.
+    // The Task 7 ruling: the script.error gate starts again too, so a load error after "fix and Apply" is
+    // never swallowed by an event the old text raised a moment before.
+    s_err_gate = LuaErrGate{};
     ReloadDone done{seq, 0, 0};
     g_L = lua_engine_new_state(lua_panic_handler);
     if (g_L) {
         load_all_scripts(g_L, &done.loaded, &done.total);
+        // A pass that completes ends a hold (the boot-loop guard) and the count of crashes behind it.
+        if (s_held.exchange(false)) ESP_LOGI(TAG, "reload completed: scripts no longer held");
+        s_guard_crashes = lua_guard_count(0, false, false);   // a count of 0
     } else {
         LuaScriptEntry entries[LUA_SCRIPT_MAX];
         done.total = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
@@ -1015,6 +1114,7 @@ static void task_lua(void* arg) {
 
         lua_State* L = g_L;   // read every step: MSG_RELOAD replaces it (NULL after a reload that failed)
         if (L) cron_tick(L);
+        report_held();
         if (!got) { s_panic_armed = false; continue; }
 
         if (m.kind == MSG_RELOAD) {
@@ -1058,6 +1158,7 @@ extern "C" int lua_scheduler_spawn(lua_State* L) {
 }
 
 extern "C" bool lua_engine_scheduler_start(lua_State* L) {
+    guard_boot_check();   // before TaskLua exists: nothing has armed the guard on this boot yet
     s_resume_q = zhac_queue_create(CONFIG_LUA_ENGINE_RESUME_QUEUE_DEPTH,
                                sizeof(LuaMsg));
     if (!s_resume_q) {

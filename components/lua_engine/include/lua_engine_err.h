@@ -53,31 +53,83 @@ inline void lua_err_parse(const char* msg, const char* ctx_name, LuaErrInfo* out
     out->message[n] = '\0';
 }
 
+// The boot-loop guard's count (lua_scheduler.cpp keeps it in no-init RAM, so it is garbage after power-on):
+// the unexpected resets in a row that found the guard armed, tagged so garbage reads as 0. `crashed` = this
+// boot follows a panic or a watchdog reset, `armed` = the scripts were starting when it happened. Two in a
+// row hold the scripts; it saturates rather than wrapping back to 0.
+constexpr uint32_t kLuaGuardTag    = 0x4C434E00u;   // "LCN" + the count in the low byte
+constexpr uint32_t kLuaGuardHoldAt = 2;
+inline uint32_t lua_guard_count(uint32_t stored, bool crashed, bool armed) {
+    uint32_t n = (stored & 0xFFFFFF00u) == kLuaGuardTag ? (stored & 0xFFu) : 0;
+    n = (crashed && armed) ? (n < 0xFFu ? n + 1 : n) : 0;
+    return kLuaGuardTag | n;
+}
+inline bool lua_guard_held(uint32_t count) { return (count & 0xFFu) >= kLuaGuardHoldAt; }
+
+// A name a stored script could have: [A-Za-z0-9_-]{1,24} (lua_script_cache's rule, remote_script_name_ok).
+inline bool lua_err_name_ok(const char* s) {
+    size_t n = 0;
+    for (; s && s[n]; n++) {
+        const char c = s[n];
+        if (n >= 24 || !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                         c == '-'))
+            return false;
+    }
+    return n > 0;
+}
+
+// The rate gate's key for an error (the Task 8 ruling). A script can forge Lua's prefix with error(msg, 0), so
+// the key is the script being loaded or run when the caller knows it (`ctx`), else the prefix's name only
+// when it could be a stored script's, else "": forged names with a quote, a newline or a stray byte all
+// share one slot. Forged valid names (x1, x2, ...) get their own slots; kLuaErrGlobalMax below ends that.
+inline const char* lua_err_gate_key(const char* ctx, const LuaErrInfo& e) {
+    if (ctx && *ctx) return ctx;
+    return lua_err_name_ok(e.name) ? e.name : "";
+}
+
 // One slot per script name: 16 stored scripts and "" for errors of unknown origin. A full table reuses
 // the slot that reported longest ago.
+constexpr uint8_t kLuaErrSlots = 17;
+// The global budget: at most this many events in a 10 s window, whatever the names. Honest scripts cannot
+// exceed it (one event per key per 10 s, and there are kLuaErrSlots keys), so it only ever stops a burst of
+// forged names from flooding the relay's 16-frame queue.
+constexpr uint8_t kLuaErrGlobalMax = kLuaErrSlots;
 struct LuaErrGate {
-    char     name[17][25];
-    uint32_t last_ms[17];
+    char     name[kLuaErrSlots][25];
+    uint32_t last_ms[kLuaErrSlots];
     uint8_t  used;
+    uint32_t window_ms;   // when the global budget's current 10 s window began
+    uint8_t  window_n;    // events in it
 };
 
-// True when `name` may raise script.error now: its first error, or 10 s after its last event. The rest go
-// to the log only, so a failing handler on a busy sensor cannot flood the cloud relay's queue (16 frames,
-// oldest dropped first) and push device events out. Unsigned subtraction survives the clock wrapping.
+// True when `name` (a key from lua_err_gate_key) may raise script.error now: its first error, or 10 s after
+// its last event, and the global budget not used up. The rest go to the log only, so a failing handler on a
+// busy sensor cannot flood the cloud relay's queue (16 frames, oldest dropped first) and push device events
+// out. Unsigned subtraction survives the clock wrapping.
 inline bool lua_err_gate_due(LuaErrGate* g, const char* name, uint32_t now_ms) {
     const char* key = name ? name : "";
-    for (uint8_t i = 0; i < g->used; i++) {
+    int found = -1;
+    for (uint8_t i = 0; i < g->used && found < 0; i++) {
         if (std::strcmp(g->name[i], key) != 0) continue;
         if (now_ms - g->last_ms[i] < kLuaErrEveryMs) return false;
-        g->last_ms[i] = now_ms;
+        found = i;
+    }
+    if (g->window_n == 0 || now_ms - g->window_ms >= kLuaErrEveryMs) {
+        g->window_ms = now_ms;
+        g->window_n  = 0;
+    }
+    if (g->window_n >= kLuaErrGlobalMax) return false;
+    g->window_n++;
+    if (found >= 0) {
+        g->last_ms[found] = now_ms;
         return true;
     }
     uint8_t slot = g->used;
-    if (slot < 17) {
+    if (slot < kLuaErrSlots) {
         g->used++;
     } else {
         slot = 0;
-        for (uint8_t i = 1; i < 17; i++) {
+        for (uint8_t i = 1; i < kLuaErrSlots; i++) {
             if (now_ms - g->last_ms[i] > now_ms - g->last_ms[slot]) slot = i;
         }
     }
