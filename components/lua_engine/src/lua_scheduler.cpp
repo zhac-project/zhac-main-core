@@ -214,6 +214,13 @@ typedef struct {
 
 static QueueHandle_t s_resume_q;
 
+// Every push goes through here: with the scheduler not created (Lua init
+// failed, e.g. out of memory) a push must fail cleanly, not hand FreeRTOS a
+// null queue and assert (review F27).
+static bool resume_q_send(const void* m) {
+    return s_resume_q != nullptr && xQueueSend(s_resume_q, m, 0) == pdTRUE;
+}
+
 // ── Counters (published via metrics + public API) ─────────────────────
 static std::atomic<std::uint_fast16_t> s_live_coroutines;
 static std::atomic<std::uint_fast32_t> s_error_count;
@@ -268,7 +275,7 @@ static void on_timer_fire(void* arg) {
     // would leak the coroutine's registry ref (never resumed, never unref'd)
     // and pin a timer slot + coroutine forever. Keep the slot and re-arm to
     // retry shortly; the ref rides along in the slot until TaskLua drains.
-    if (xQueueSend(s_resume_q, &m, 0) == pdTRUE) {
+    if (resume_q_send(&m)) {
         // T20 (slot store order): clear coroutine_ref BEFORE releasing
         // in_use. on_timer_fire runs on the esp_timer task while
         // slot_acquire runs on TaskLua; if in_use dropped first, a
@@ -340,7 +347,7 @@ extern "C" bool lua_scheduler_push_resume(int coroutine_ref) {
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
     m.resume.coroutine_ref = coroutine_ref;
-    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
 }
@@ -373,7 +380,7 @@ extern "C" bool lua_scheduler_push_run_named(const char* name,
         m.named.val_type = args->val_type;
         m.named.int_val  = args->int_val;
     }
-    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
 }
@@ -389,7 +396,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
     // From EventBus context — the event_bus task isn't an ISR, so a
     // normal send is correct. Use 0 timeout; if TaskLua is behind we
     // drop the event rather than blocking the publisher.
-    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
 }
@@ -404,7 +411,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
 extern "C" bool lua_scheduler_push_load_all(void) {
     LuaMsg m = {};
     m.kind = MSG_LOAD_ALL;
-    bool ok = xQueueSend(s_resume_q, &m, 0) == pdTRUE;
+    bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
 }
