@@ -34,6 +34,7 @@
 
 extern "C" {
 #include "lua_alloc.h"
+#include "lua_attr_value.h"
 #include "lua_engine.h"
 #include "lua_engine_scripts.h"
 #include "lua_internal.h"
@@ -534,7 +535,6 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             const char* key = (const char*)(p + offsetof(ZclAttrEvent, key));
             const uint8_t val_type = p[offsetof(ZclAttrEvent, val_type)];
             const size_t  val_off  = offsetof(ZclAttrEvent, int_val);  // == str_val (union)
-            // val_type: 0=INT, 1=BOOL, 2=STR (see attr_keys.h).
             char ieee_hex[20];
             snprintf(ieee_hex, sizeof(ieee_hex), "0x%016llx",
                      (unsigned long long)ieee);
@@ -547,16 +547,7 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             // walks to a NUL) over-reading past the field into adjacent
             // payload bytes. Bound both pushes by the field size.
             lua_pushlstring(co, key, strnlen(key, ATTR_KEY_MAX));
-            if (val_type == 2) {
-                const char* sv = (const char*)(p + val_off);
-                lua_pushlstring(co, sv, strnlen(sv, ATTR_STR_MAX));
-            } else if (val_type == 1) {
-                int32_t v; memcpy(&v, p + val_off, 4);
-                lua_pushboolean(co, v != 0);
-            } else {
-                int32_t v; memcpy(&v, p + val_off, 4);
-                lua_pushinteger(co, v);
-            }
+            lua_push_attr_value(co, val_type, p + val_off);
             lua_pushinteger(co, cluster);
             lua_pushinteger(co, attr_id);
             return 5;
