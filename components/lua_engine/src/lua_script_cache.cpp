@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,7 +24,10 @@
 #include "lua_engine_scripts.h"
 
 static const char* TAG             = "lua_script";
-static const char* BASE_PATH       = "/scripts";
+#ifndef LUA_SCRIPT_BASE_PATH
+#define LUA_SCRIPT_BASE_PATH "/scripts"   // host tests point it at a directory
+#endif
+static const char* BASE_PATH       = LUA_SCRIPT_BASE_PATH;
 static const char* PARTITION_LABEL = "scripts";
 
 // Generous upper bound for any on-disk path we build. `dirent::d_name`
@@ -70,6 +74,47 @@ uint16_t count_scripts() {
 // One-shot lazy mount. `esp_vfs_spiffs_register` returns
 // ESP_ERR_INVALID_STATE if someone else already mounted — treat that
 // as success for idempotence.
+// Every store operation runs under this lock: saves come from the local
+// web UI, the cloud relay and rules on different tasks, and a replace is
+// several filesystem steps that must not interleave (review F08).
+std::mutex s_mtx;
+
+bool exists_unlocked(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+// After a power cut in the middle of a replace (lua_script_cache_write):
+// `x.lua.bak` without `x.lua` is the old version, put it back; next to
+// `x.lua` it is leftover. A `x.lua.tmp` never finished. Runs at mount.
+void recover_interrupted_saves() {
+    DIR* d = opendir(BASE_PATH);
+    if (!d) return;
+    char names[LUA_SCRIPT_MAX * 2][LUA_SCRIPT_NAME_MAX + 9];   // "<name>.lua.bak"
+    int n = 0;
+    struct dirent* ent;
+    while ((ent = readdir(d)) && n < (int)(sizeof(names) / sizeof(names[0]))) {
+        const size_t flen = std::strlen(ent->d_name);
+        if (flen >= sizeof(names[0]) || flen < 9) continue;
+        if (std::strcmp(ent->d_name + flen - 8, ".lua.bak") == 0 ||
+            std::strcmp(ent->d_name + flen - 8, ".lua.tmp") == 0)
+            std::memcpy(names[n++], ent->d_name, flen + 1);
+    }
+    closedir(d);
+    for (int i = 0; i < n; i++) {
+        char leftover[BASE_PATH_MAX], script[BASE_PATH_MAX];
+        const int len = (int)std::strlen(names[i]);   // < sizeof(names[0]), checked above
+        std::snprintf(leftover, sizeof(leftover), "%s/%.*s", BASE_PATH, len, names[i]);
+        std::snprintf(script, sizeof(script), "%s/%.*s", BASE_PATH, len - 4, names[i]);   // drop ".bak" / ".tmp"
+        const bool bak = std::strcmp(names[i] + len - 4, ".bak") == 0;
+        if (bak && !exists_unlocked(script) && rename(leftover, script) == 0) {
+            ESP_LOGW(TAG, "restored '%s' after an interrupted save", script);
+            continue;
+        }
+        unlink(leftover);
+    }
+}
+
 bool ensure_mounted() {
     static bool mounted = false;
     if (mounted) return true;
@@ -90,6 +135,7 @@ bool ensure_mounted() {
         ESP_LOGI(TAG, "SPIFFS mounted at %s — %zu/%zu bytes used",
                  BASE_PATH, used, total);
     }
+    recover_interrupted_saves();
     mounted = true;
     return true;
 }
@@ -97,6 +143,7 @@ bool ensure_mounted() {
 }  // namespace
 
 extern "C" uint16_t lua_script_cache_list(LuaScriptEntry* out, uint16_t max) {
+    std::lock_guard<std::mutex> lock(s_mtx);
     if (!out || max == 0 || !ensure_mounted()) return 0;
     DIR* d = opendir(BASE_PATH);
     if (!d) return 0;
@@ -127,6 +174,7 @@ extern "C" uint16_t lua_script_cache_list(LuaScriptEntry* out, uint16_t max) {
 }
 
 extern "C" int lua_script_cache_read(const char* name, char* out, size_t cap) {
+    std::lock_guard<std::mutex> lock(s_mtx);
     if (!name_ok(name) || !out || cap == 0 || !ensure_mounted()) return -1;
     char path[96];
     if (!build_path(path, sizeof(path), name)) return -1;
@@ -154,6 +202,7 @@ extern "C" int lua_script_cache_read(const char* name, char* out, size_t cap) {
 }
 
 extern "C" bool lua_script_cache_write(const char* name, const char* src) {
+    std::lock_guard<std::mutex> lock(s_mtx);
     if (!name_ok(name) || !src || !ensure_mounted()) return false;
     const size_t src_len = std::strlen(src);
     if (src_len > LUA_SCRIPT_SRC_MAX) {   // T20: unified cap (was 16*1024 literal)
@@ -165,16 +214,17 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
     // F42 (FINDINGS.md): enforce LUA_SCRIPT_MAX. Overwriting an existing script
     // is always allowed (count unchanged); only a NEW file is capped, so the
     // scripts partition can't be exhausted by unbounded script count.
-    if (!lua_script_cache_exists(name) && count_scripts() >= LUA_SCRIPT_MAX) {
+    char path[96], tmp[104], bak[104];
+    if (!build_path(path, sizeof(path), name)) return false;
+    if (!exists_unlocked(path) && count_scripts() >= LUA_SCRIPT_MAX) {
         ESP_LOGW(TAG, "script cap reached (%d files) — '%s' rejected",
                  LUA_SCRIPT_MAX, name);
         return false;
     }
 
-    char path[96], tmp[104];
-    if (!build_path(path, sizeof(path), name)) return false;
     const int n = std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     if (n <= 0 || (size_t)n >= sizeof(tmp)) return false;
+    std::snprintf(bak, sizeof(bak), "%s.bak", path);   // same length as tmp
 
     FILE* fp = std::fopen(tmp, "w");
     if (!fp) {
@@ -194,22 +244,31 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
         unlink(tmp);
         return false;
     }
-    // SPIFFS's rename() does NOT overwrite an existing destination
-    // (unlike POSIX). Unlink the target first if present. This opens
-    // a small power-loss window where the destination is gone and the
-    // .tmp hasn't been renamed yet — on crash the script reverts to
-    // "not present" on next boot, which is the safer failure mode
-    // than leaving a corrupt half-written file.
-    unlink(path);   // no-op if absent
+    // SPIFFS's rename() does NOT overwrite an existing destination (unlike
+    // POSIX). The old version steps aside as .bak instead of being deleted,
+    // so a power cut at any point leaves the old or the new script, and
+    // recover_interrupted_saves() sorts it out at the next mount (review F21).
+    const bool had = exists_unlocked(path);
+    if (had) {
+        unlink(bak);   // leftover, if any
+        if (rename(path, bak) != 0) {
+            ESP_LOGE(TAG, "rename '%s' → '%s' failed", path, bak);
+            unlink(tmp);
+            return false;
+        }
+    }
     if (rename(tmp, path) != 0) {
         ESP_LOGE(TAG, "rename '%s' → '%s' failed", tmp, path);
+        if (had) rename(bak, path);   // the old version stays
         unlink(tmp);
         return false;
     }
+    if (had) unlink(bak);
     return true;
 }
 
 extern "C" bool lua_script_cache_delete(const char* name) {
+    std::lock_guard<std::mutex> lock(s_mtx);
     if (!name_ok(name) || !ensure_mounted()) return false;
     char path[96];
     if (!build_path(path, sizeof(path), name)) return false;
@@ -218,11 +277,11 @@ extern "C" bool lua_script_cache_delete(const char* name) {
 }
 
 extern "C" bool lua_script_cache_exists(const char* name) {
+    std::lock_guard<std::mutex> lock(s_mtx);
     if (!name_ok(name) || !ensure_mounted()) return false;
     char path[96];
     if (!build_path(path, sizeof(path), name)) return false;
-    struct stat st;
-    return stat(path, &st) == 0;
+    return exists_unlocked(path);
 }
 
 #endif
