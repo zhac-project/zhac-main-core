@@ -26,6 +26,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **`lua_engine`: `require` loads every module the store accepts** (review F28): the store takes scripts up to 16 KB, the loader read them into 8 KB, so a module of 8192 bytes or more saved and ran directly but `require` said it did not exist. Host-tested (`test/require/`).
+
+- **`lua_engine`: with Lua down, scheduling fails cleanly** (review F27): when `lua_engine_init()` failed (out of memory) the scheduler queue did not exist, and a rule's `script.run` or an event push handed FreeRTOS a null queue and asserted. Every push now refuses when the scheduler is not running.
+
 - **`lua_engine`: a script is never lost while it is saved** (review F08, F21): two saves of the same script at once (web UI and cloud) shared one temporary file, so a save could acknowledge the other's text or leave the script deleted; and replacing a script deleted the old version before the new one was in place, so a power cut there left none. Every store operation now runs under one lock, the old version is set aside as `<name>.lua.bak` until the new one is in place, and the first mount after a power cut puts it back. Host-tested (`test/script_store/`, SPIFFS-style rename).
 
 - **`lua_engine`: attribute-change handlers get the right value types** (review F03): the scheduler read the value tag with the old numbering (1 = boolean, 2 = string) while events carry `zcl_attribute.h`'s `ValType` (INT 1, BOOL 2, STR 3, FLOAT 4), so a number arrived as `true`, `false` as an empty (truthy) string and a text value as a number. The mapping lives in `src/lua_attr_value.h`, host-tested against the real Lua library (`test/attr_value/`); a decimal value stays the raw ×100 integer, as in rules.

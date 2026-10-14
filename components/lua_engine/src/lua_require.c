@@ -31,7 +31,9 @@ static int loader_script_cache(lua_State* L) {
 
     // Names in lua_script_cache don't carry the extension — `require
     // "util"` matches a stored entry named `util`.
-    enum { kBufSz = 8192 };
+    // Every script the store accepts, plus the terminator: 8 KB refused
+    // modules of 8192-16384 bytes that saved and ran fine (review F28).
+    enum { kBufSz = LUA_SCRIPT_SRC_MAX + 1 };
     static char* buf = NULL;
     if (!buf) {
         buf = (char*)heap_caps_malloc(kBufSz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
