@@ -583,13 +583,18 @@ static void json_append_string(lua_State *l, strbuf_t *json, int lindex)
 
     str = lua_tolstring(l, lindex, &len);
 
-    /* Worst case is len * 6 (all unicode escapes).
-     * This buffer is reused constantly for small strings
-     * If there are any excess pages, they won't be hit anyway.
-     * This gains ~5% speedup. */
-    if (len > SIZE_MAX / 6 - 3)
-        abort(); /* Overflow check */
-    strbuf_ensure_empty_length(json, len * 6 + 2);
+    /* ZHAC (review F20): the output limit holds for one string too, and only
+     * the exact escaped size is reserved. Checking before each value let a
+     * single 70000-byte string through, after reserving len * 6 bytes of
+     * scratch outside the Lua budget (and an allocation failure aborts). */
+    size_t out = 2;
+    for (i = 0; i < len && out <= CJSON_ENCODE_MAX_OUTPUT; i++) {
+        escstr = char2escape[(unsigned char)str[i]];
+        out += escstr ? strlen(escstr) : 1;
+    }
+    if (strbuf_length(json) + out > CJSON_ENCODE_MAX_OUTPUT)
+        luaL_error(l, "cjson: encode output exceeds %d bytes", CJSON_ENCODE_MAX_OUTPUT);
+    strbuf_ensure_empty_length(json, out);
 
     strbuf_append_char_unsafe(json, '\"');
     for (i = 0; i < len; i++) {
@@ -937,6 +942,9 @@ static int json_encode(lua_State *l)
     }
 
     json_append_data(l, cfg, 0, encode_buf);
+    /* ZHAC (review F20): the whole result, not only what preceded each value. */
+    if (strbuf_length(encode_buf) > CJSON_ENCODE_MAX_OUTPUT)
+        luaL_error(l, "cjson: encode output exceeds %d bytes", CJSON_ENCODE_MAX_OUTPUT);
     json = strbuf_string(encode_buf, &len);
 
     lua_pushlstring(l, json, len);

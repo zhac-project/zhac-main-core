@@ -26,6 +26,8 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Fixed
 
+- **`lua_cjson`: the 64 KB encode limit holds for a single value** (review F20): it was checked before each value, so `cjson.encode(string.rep('a', 70000))` produced 70002 bytes after reserving six times the string's length outside the Lua memory budget. Each string's exact escaped size is now checked against the limit before anything is reserved (and only that size is reserved), and the finished result is checked too. Host-tested with the real library (`components/lua_cjson/test/cap/`).
+
 - **`lua_engine`: `require` loads every module the store accepts** (review F28): the store takes scripts up to 16 KB, the loader read them into 8 KB, so a module of 8192 bytes or more saved and ran directly but `require` said it did not exist. Host-tested (`test/require/`).
 
 - **`lua_engine`: with Lua down, scheduling fails cleanly** (review F27): when `lua_engine_init()` failed (out of memory) the scheduler queue did not exist, and a rule's `script.run` or an event push handed FreeRTOS a null queue and asserted. Every push now refuses when the scheduler is not running.
