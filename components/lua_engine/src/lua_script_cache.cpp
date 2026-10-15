@@ -85,8 +85,9 @@ bool exists_unlocked(const char* path) {
 }
 
 // After a power cut in the middle of a replace (lua_script_cache_write):
-// `x.lua.bak` without `x.lua` is the old version, put it back; next to
-// `x.lua` it is leftover. A `x.lua.tmp` never finished. Runs at mount.
+// `x.bak` without `x.lua` is the old version, put it back; next to `x.lua`
+// it is leftover. A `x.tmp` never finished. Runs at mount. v2026101401 named
+// them `x.lua.bak` / `x.lua.tmp`; those are sorted out the same way.
 void recover_interrupted_saves() {
     DIR* d = opendir(BASE_PATH);
     if (!d) return;
@@ -95,18 +96,20 @@ void recover_interrupted_saves() {
     struct dirent* ent;
     while ((ent = readdir(d)) && n < (int)(sizeof(names) / sizeof(names[0]))) {
         const size_t flen = std::strlen(ent->d_name);
-        if (flen >= sizeof(names[0]) || flen < 9) continue;
-        if (std::strcmp(ent->d_name + flen - 8, ".lua.bak") == 0 ||
-            std::strcmp(ent->d_name + flen - 8, ".lua.tmp") == 0)
+        if (flen >= sizeof(names[0]) || flen < 5) continue;
+        if (std::strcmp(ent->d_name + flen - 4, ".bak") == 0 ||
+            std::strcmp(ent->d_name + flen - 4, ".tmp") == 0)
             std::memcpy(names[n++], ent->d_name, flen + 1);
     }
     closedir(d);
     for (int i = 0; i < n; i++) {
         char leftover[BASE_PATH_MAX], script[BASE_PATH_MAX];
-        const int len = (int)std::strlen(names[i]);   // < sizeof(names[0]), checked above
+        const int len  = (int)std::strlen(names[i]);   // < sizeof(names[0]), checked above
+        const int base = len - 4;                      // drop ".bak" / ".tmp"
+        const bool old_name = base > 4 && std::strncmp(names[i] + base - 4, ".lua", 4) == 0;
         std::snprintf(leftover, sizeof(leftover), "%s/%.*s", BASE_PATH, len, names[i]);
-        std::snprintf(script, sizeof(script), "%s/%.*s", BASE_PATH, len - 4, names[i]);   // drop ".bak" / ".tmp"
-        const bool bak = std::strcmp(names[i] + len - 4, ".bak") == 0;
+        std::snprintf(script, sizeof(script), "%s/%.*s%s", BASE_PATH, base, names[i], old_name ? "" : ".lua");
+        const bool bak = std::strcmp(names[i] + base, ".bak") == 0;
         if (bak && !exists_unlocked(script) && rename(leftover, script) == 0) {
             ESP_LOGW(TAG, "restored '%s' after an interrupted save", script);
             continue;
@@ -166,7 +169,11 @@ extern "C" uint16_t lua_script_cache_list(LuaScriptEntry* out, uint16_t max) {
         char path[BASE_PATH_MAX];
         std::snprintf(path, sizeof(path), "%s/%s", BASE_PATH, fname);
         struct stat st;
-        out[count].size = (stat(path, &st) == 0) ? (uint16_t)st.st_size : 0;
+        const bool have = stat(path, &st) == 0;
+        out[count].size  = have ? (uint16_t)st.st_size : 0;
+        // SPIFFS keeps the time of the last write (CONFIG_SPIFFS_USE_MTIME): a real date only when the
+        // hub's clock was set then; callers drop values under 1,600,000,000.
+        out[count].mtime = have ? (uint32_t)st.st_mtime : 0;
         count++;
     }
     closedir(d);
@@ -222,9 +229,13 @@ extern "C" bool lua_script_cache_write(const char* name, const char* src) {
         return false;
     }
 
-    const int n = std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    // The temp file and the set-aside old version are /<name>.tmp and /<name>.bak, not /<name>.lua.tmp:
+    // SPIFFS object names hold at most 31 characters (CONFIG_SPIFFS_OBJ_NAME_LEN=32 with the NUL), so a
+    // 23- or 24-character name could not be saved (spec 2026-10-05 §3.8). list/count only look at *.lua,
+    // so neither is ever a script.
+    const int n = std::snprintf(tmp, sizeof(tmp), "%s/%s.tmp", BASE_PATH, name);
     if (n <= 0 || (size_t)n >= sizeof(tmp)) return false;
-    std::snprintf(bak, sizeof(bak), "%s.bak", path);   // same length as tmp
+    std::snprintf(bak, sizeof(bak), "%s/%s.bak", BASE_PATH, name);   // same length as tmp
 
     FILE* fp = std::fopen(tmp, "w");
     if (!fp) {

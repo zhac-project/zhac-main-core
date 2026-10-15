@@ -19,8 +19,14 @@
 
 // SPIFFS's rename() does not replace an existing file (POSIX's does); the
 // store's calls are routed here at link time (-Wl,--wrap=rename).
+// It also notes the longest file name the store renames: SPIFFS object names
+// hold at most 31 characters (CONFIG_SPIFFS_OBJ_NAME_LEN=32 with the NUL).
+static size_t g_longest = 0;
+static size_t base_len(const char* p) { const char* s = std::strrchr(p, '/'); return std::strlen(s ? s + 1 : p); }
 extern "C" int __real_rename(const char* from, const char* to);
 extern "C" int __wrap_rename(const char* from, const char* to) {
+    if (base_len(from) > g_longest) g_longest = base_len(from);
+    if (base_len(to) > g_longest) g_longest = base_len(to);
     struct stat st;
     if (stat(to, &st) == 0) { errno = EEXIST; return -1; }
     return __real_rename(from, to);
@@ -58,10 +64,24 @@ int main() {
     // Power cut after the new version landed, before the old one was dropped.
     put("done.lua", "-- new");
     put("done.lua.bak", "-- old");
+    // The same with today's names (<name>.bak / <name>.tmp).
+    put("cut2.bak", "-- old");
+    put("cut2.tmp", "-- new, maybe half");
+    put("done2.lua", "-- new");
+    put("done2.bak", "-- old");
     expect("a script cut mid-replace comes back as its old version", get("cut") == "-- old");
     expect("  its half-written copy is gone", !there("cut.lua.tmp"));
     expect("a finished replace keeps the new version", get("done") == "-- new");
     expect("  and drops the old one", !there("done.lua.bak"));
+    expect("today's names: a cut replace comes back as the old version", get("cut2") == "-- old" && !there("cut2.tmp"));
+    expect("  a finished one keeps the new version", get("done2") == "-- new" && !there("done2.bak"));
+
+    // A 24-character name: its temp and set-aside names fit SPIFFS.
+    const char* longest = "abcdefghijklmnopqrstuvwx";
+    expect("a 24-character name saves", lua_script_cache_write(longest, "-- 1") && lua_script_cache_write(longest, "-- 2"));
+    expect("  and reads back", get(longest) == "-- 2");
+    expect("  every name the save renames fits 31 characters", g_longest <= 31);
+    if (g_longest > 31) std::printf("     (longest %zu)\n", g_longest);
 
     // Two saves of one script at once, and a reader.
     const std::string a(3000, 'a'), b(3000, 'b');

@@ -20,6 +20,7 @@ if(IDF_TARGET STREQUAL "esp32p4")
                       device_shadow mqtt_gw tg_gw zigbee_mgr
                       simple_rules lua_cjson
     )
+    include(${CMAKE_CURRENT_LIST_DIR}/lua_limits.cmake)   # the Lua C-stack limits
 else()
     # S3 + any other future target: register an empty component so
     # auto-discovery doesn't try to resolve the `lua` dep (only P4's

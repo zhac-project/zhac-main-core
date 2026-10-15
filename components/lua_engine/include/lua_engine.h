@@ -55,6 +55,35 @@ bool lua_engine_check_syntax(const char* name, const char* src,
                               char* err_out, size_t err_cap,
                               int*   line_out);
 
+// script.error (spec 2026-10-05 §3.6): called on TaskLua when a script fails to compile at load, reload
+// or run, or raises an error while running. `name` and `line` come from Lua's `[string "<name>"]:<line>:`
+// prefix ("" and 0 when unknown); `message` is Lua's text without it, at most 120 bytes. At most once per
+// script per 10 s; the rest go to the log only. NULL = none.
+typedef void (*LuaErrorHook)(const char* name, int line, const char* message);
+void lua_engine_set_error_hook(LuaErrorHook hook);
+
+// script.reload (spec 2026-10-05 §3.5): on TaskLua, stops every sleep timer, drops the old state's queued
+// resumes, events and runs, closes the Lua state, opens a fresh one as lua_engine_init does (no new task,
+// queue, event bridge or rules hook) and loads every stored script as at boot -- on_boot handlers are not
+// called again. Rules are not touched; script state (globals, pending zhac.sleep) is lost on purpose.
+// Waits up to `wait_ms`:
+//   LUA_RELOAD_DONE   -- finished; *loaded of *total scripts started;
+//   LUA_RELOAD_QUEUED -- still running after wait_ms (it finishes anyway);
+//   LUA_RELOAD_BUSY   -- TaskLua's queue is full; nothing was asked.
+typedef enum { LUA_RELOAD_DONE = 0, LUA_RELOAD_QUEUED = 1, LUA_RELOAD_BUSY = 2 } LuaReloadResult;
+LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total);
+
+// The boot-loop guard: NULL while scripts run normally. After two unexpected resets in a row (panic,
+// watchdog) that hit the scripts starting (a load pass, boot or reload, or the minute after it), the boot
+// does not load them and this returns the name of the script that was loading at the last crash, or ""
+// when the crash came after the pass. Named runs (a rule's script.run action, Run) are skipped too. Logged
+// at boot and raised as script.error once a minute while it lasts; ends with a script.reload that
+// completes, or a clean boot (power-on, software restart).
+// Any task.
+const char* lua_engine_scripts_held(void);
+// What a run request answers while the scripts are held (TaskLua skips it).
+#define LUA_ENGINE_HELD_ERR "scripts are held: the hub restarted twice while scripts were starting; Apply starts them again"
+
 #ifdef __cplusplus
 }
 #endif

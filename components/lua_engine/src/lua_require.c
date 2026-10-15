@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 
+#include "lua_engine_limits.h"
 #include "lua_engine_scripts.h"
 #include "lua_internal.h"
 
@@ -80,17 +81,9 @@ bool lua_engine_require_install(lua_State* L) {
 
 #if CONFIG_LUA_ENGINE_WITH_CJSON
     luaL_requiref(L, "cjson", luaopen_cjson, 1);
-#if CONFIG_LUA_ENGINE_CJSON_DECODE_MAX_DEPTH > 0
-    // The table from luaL_requiref is on top of the stack; look up
-    // decode_max_depth on it and call with the cap.
-    lua_getfield(L, -1, "decode_max_depth");
-    if (lua_isfunction(L, -1)) {
-        lua_pushinteger(L, CONFIG_LUA_ENGINE_CJSON_DECODE_MAX_DEPTH);
-        lua_call(L, 1, 0);
-    } else {
-        lua_pop(L, 1);
-    }
-#endif
+    // The table from luaL_requiref is on top of the stack: encode and decode nesting capped at 16, the depth
+    // setters and cjson.new() removed (lua_engine_limits.h, the C-stack limits).
+    lua_engine_cjson_limit(L);
     lua_pop(L, 1);
     ESP_LOGI(TAG, "cjson preloaded");
 #endif

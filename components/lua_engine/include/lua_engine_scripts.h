@@ -26,6 +26,7 @@ extern "C" {
 typedef struct {
     char     name[LUA_SCRIPT_NAME_MAX + 1];
     uint16_t size;
+    uint32_t mtime;   // last write, epoch s (SPIFFS mtime); a real date only if the clock was set then
 } LuaScriptEntry;
 
 // List entries into caller-provided array. Returns count written.

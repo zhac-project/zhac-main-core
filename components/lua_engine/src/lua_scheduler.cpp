@@ -19,10 +19,13 @@
 #include <atomic>
 #include <csetjmp>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <strings.h>
 
+#include "esp_attr.h"     // __NOINIT_ATTR: the boot-loop guard
+#include "esp_system.h"   // esp_reset_reason
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
@@ -41,6 +44,8 @@ extern "C" {
 #include "lua_scheduler.h"
 }
 #include "metrics/metrics_macros.h"
+#include "lua_engine_err.h"
+#include "lua_engine_guard.h"   // the boot-loop guard's pure parts (host-tested)
 // T20: derive the ZclAttrEvent payload layout from the canonical schema
 // constants instead of hardcoded offsets. event_bus schema v6 widened
 // ATTR_KEY_MAX 20→28, which slid the value union from offset 36 to 44;
@@ -83,6 +88,95 @@ static volatile bool s_panic_armed = false;
 // coroutine is in flight at a time. POD — longjmp bypasses C++ destructors.
 struct InFlightCo { int ref = LUA_NOREF; bool counted = false; };
 static InFlightCo s_inflight;
+
+// ── script.error reports (spec 2026-10-05 §3.6) ───────────────────────
+static std::atomic<LuaErrorHook> s_error_hook{nullptr};
+static LuaErrGate                s_err_gate;   // TaskLua only
+
+// ── Boot-loop guard (final fix wave, I-2(b)) ──────────────────────────
+// A stored script that crashes the hub (C stack, a binding bug, a watchdog during a long load) crashes it
+// again at every boot, and a hub that never stays up cannot be fixed over the network. No-init RAM
+// survives a panic or watchdog reset but not a power cycle (esp_zigbee_backend's radio guard works the
+// same way). s_guard_mark is armed while TaskLua loads the scripts (boot or reload) and for kGuardWindowS
+// after, so on_boot handlers and the first events count too; s_guard_crashes counts the unexpected resets
+// in a row that found it armed. From two on, lua_engine_load_all does not load the scripts: the hold is
+// logged, reported (lua_engine_scripts_held(), and script.error every minute while it lasts) and ends
+// with a reload that completes (Apply) or a clean boot.
+static __NOINIT_ATTR uint32_t s_guard_mark;
+static __NOINIT_ATTR uint32_t s_guard_crashes;     // lua_guard_count() (lua_engine_guard.h, host-tested)
+static __NOINIT_ATTR char     s_guard_script[25];  // the script loading when it was armed, else ""
+static constexpr uint32_t kGuardArmed  = 0x4C554147;   // "LUAG"
+static constexpr int      kGuardWindowS = 60;
+static std::atomic<bool>  s_held{false};
+static char               s_held_script[25];   // copied from s_guard_script at boot; "" when unknown
+static esp_timer_handle_t s_guard_timer;
+
+// At boot, before TaskLua runs: count this reset and decide whether to hold the scripts.
+static void guard_boot_check() {
+    const bool crashed = lua_guard_crashed(esp_reset_reason());
+    s_guard_crashes = lua_guard_count(s_guard_crashes, crashed, s_guard_mark == kGuardArmed);
+    s_guard_mark = 0;
+    s_guard_script[sizeof(s_guard_script) - 1] = '\0';   // garbage after power-on; only read when held
+    if (!lua_guard_held(s_guard_crashes)) return;
+    if (lua_err_name_ok(s_guard_script)) std::memcpy(s_held_script, s_guard_script, sizeof(s_held_script));
+    s_held = true;
+    ESP_LOGE(TAG, "the hub restarted %u times in a row while scripts were starting (last: '%s') -- scripts NOT "
+                  "started this boot; fix or delete the script, then Apply (script.reload)",
+             static_cast<unsigned>(s_guard_crashes & 0xFFu), s_held_script);
+}
+
+// TaskLua: armed for a load pass; `script` is the one loading now ("" after the pass). Stops the window
+// timer of an earlier pass, which would otherwise disarm this one halfway.
+static void guard_arm(const char* script) {
+    if (s_guard_timer) esp_timer_stop(s_guard_timer);   // ESP_ERR_INVALID_STATE when not running: fine
+    std::snprintf(s_guard_script, sizeof(s_guard_script), "%.24s", script);
+    s_guard_mark = kGuardArmed;
+}
+
+// After a load pass: still armed for kGuardWindowS, then cleared by the timer (esp_timer task).
+static void guard_window() {
+    if (!s_guard_timer) {
+        esp_timer_create_args_t args{};
+        args.callback = [](void*) { s_guard_mark = 0; };
+        args.name     = "lua_boot_guard";
+        if (esp_timer_create(&args, &s_guard_timer) != ESP_OK) { s_guard_mark = 0; return; }   // unguarded
+    }
+    esp_timer_start_once(s_guard_timer, static_cast<uint64_t>(kGuardWindowS) * 1000000ULL);
+}
+
+extern "C" const char* lua_engine_scripts_held(void) { return s_held.load() ? s_held_script : nullptr; }
+
+static void report_error(const char* script, const char* msg);
+
+// TaskLua, every step: while the scripts are held, script.error says so once a minute (under the script
+// that was loading, when known). Neither the cloud link nor a hub page is up at boot, and the cloud keeps
+// the last error per script, so one event would be lost.
+static void report_held() {
+    static int64_t last_us = 0;
+    if (!s_held.load()) return;
+    const int64_t now = esp_timer_get_time();
+    if (last_us && now - last_us < 60LL * 1000000) return;
+    last_us = now;
+    report_error(s_held_script[0] ? s_held_script : nullptr,
+                 "not started: the hub restarted twice in a row while scripts were starting; "
+                 "fix or delete the script, then Apply");
+}
+
+extern "C" void lua_engine_set_error_hook(LuaErrorHook hook) { s_error_hook.store(hook); }
+
+// Hands one Lua error (already logged by the caller) to the hook, at most once per script per 10 s and
+// kLuaErrGlobalMax in all. `script`: the script being loaded or run, when the caller knows it. The gate keys
+// on that, else on a name a stored script could have: a forged `[string "<name>"]:` prefix cannot buy
+// more events.
+static void report_error(const char* script, const char* msg) {
+    const LuaErrorHook hook = s_error_hook.load();
+    if (!hook) return;
+    LuaErrInfo e;
+    lua_err_parse(msg, script, &e);
+    if (lua_err_gate_due(&s_err_gate, lua_err_gate_key(script, e), static_cast<uint32_t>(esp_timer_get_time() / 1000))) {
+        hook(e.name, e.line, e.message);
+    }
+}
 
 static int lua_panic_handler(lua_State* L) {
     const char* msg = lua_tostring(L, -1);
@@ -132,8 +226,13 @@ static void lua_resume_count_hook(lua_State* L, lua_Debug*) {
         s_resume_killed = true;
         lua_sethook(L, lua_resume_count_hook, LUA_MASKCOUNT, 1);
     }
-    luaL_error(L, "lua_engine: resume exceeded %lld us budget",
-               (long long)LUA_RESUME_DEADLINE_US);
+    // Lua 5.5's lua_pushfstring has no %l ("invalid option '%l'" was the whole message), so %I with a
+    // lua_Integer. Level 0, not luaL_error's 1: inside a hook level 0 is the running script, which keeps the
+    // `[string "<name>"]:<line>:` prefix script.error attributes the error by.
+    luaL_where(L, 0);
+    lua_pushfstring(L, "lua_engine: resume exceeded %I us budget", static_cast<lua_Integer>(LUA_RESUME_DEADLINE_US));
+    lua_concat(L, 2);
+    lua_error(L);
 }
 
 static void arm_resume_deadline(lua_State* co) {
@@ -150,6 +249,7 @@ typedef struct {
     esp_timer_handle_t handle;
     int                coroutine_ref;   // -1 = free
     std::atomic<bool>  in_use;          // release/acquire — see on_timer_fire / slot_acquire
+    uint32_t           gen;             // the reload generation that armed it (s_gen below)
 } TimerSlot;
 
 static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
@@ -163,11 +263,14 @@ static TimerSlot s_timer_pool[CONFIG_LUA_ENGINE_TIMER_POOL];
 //  - MSG_RUN_NAMED: compile + run one named script from the cache.
 //  - MSG_LOAD_ALL:  boot-time pass — compile + start every stored
 //                   script. No payload.
+//  - MSG_RELOAD:    script.reload — a fresh lua_State with every stored
+//                   script (spec 2026-10-05 §3.5).
 enum LuaMsgKind : uint8_t {
     MSG_RESUME    = 0,
     MSG_EVENT     = 1,
     MSG_RUN_NAMED = 2,
     MSG_LOAD_ALL  = 3,
+    MSG_RELOAD    = 4,
 };
 
 enum LuaEventKind : uint8_t {
@@ -204,11 +307,17 @@ typedef struct {
 } RunNamedArgs;
 
 typedef struct {
+    uint32_t seq;                 // the lua_engine_reload() call waiting for this pass
+} ReloadArgs;
+
+typedef struct {
     LuaMsgKind kind;
+    uint32_t   gen;               // s_gen when queued; a reload drops older ones
     union {
         ResumeArgs   resume;
         EventArgs    event;
         RunNamedArgs named;
+        ReloadArgs   reload;
     };
 } LuaMsg;
 
@@ -220,6 +329,17 @@ static QueueHandle_t s_resume_q;
 static bool resume_q_send(const void* m) {
     return s_resume_q != nullptr && xQueueSend(s_resume_q, m, 0) == pdTRUE;
 }
+
+// Reload generations (spec 2026-10-05 §3.5): every queued message and armed sleep slot carries the
+// generation it was made in, and a reload starts a new one, so TaskLua drops the old state's resumes,
+// events and runs as they arrive. A resume of an old registry ref into the new state would release a
+// slot some new object holds.
+static std::atomic<uint32_t> s_gen{1};
+
+// The last finished reload, for lua_engine_reload() to wait on (a 1-item queue, overwritten).
+typedef struct { uint32_t seq; uint16_t loaded; uint16_t total; } ReloadDone;
+static QueueHandle_t         s_reload_done;
+static std::atomic<uint32_t> s_reload_seq{0};
 
 // ── Counters (published via metrics + public API) ─────────────────────
 static std::atomic<std::uint_fast16_t> s_live_coroutines;
@@ -265,8 +385,10 @@ extern "C" void lua_scheduler_yield_bump(void) {
 static void on_timer_fire(void* arg) {
     TimerSlot* slot = (TimerSlot*)arg;
     if (!slot || !slot->in_use.load(std::memory_order_acquire)) return;
+    const uint32_t gen = slot->gen;
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
+    m.gen                  = gen;
     m.resume.coroutine_ref = slot->coroutine_ref;
     // Runs on the esp_timer TASK (dispatch_method = ESP_TIMER_TASK above), not
     // an ISR — a plain xQueueSend is correct (the old xQueueSendFromISR was a
@@ -283,11 +405,15 @@ static void on_timer_fire(void* arg) {
         // new ref and then this store would clobber it back to -1,
         // orphaning the freshly-parked coroutine. Ref-then-flag closes
         // the window (the slot isn't claimable until in_use is false).
-        slot->coroutine_ref = -1;
-        // release: publishes the coroutine_ref=-1 store above before another
-        // core can observe the slot as free (enforces the ref-then-flag order
-        // the comment above intends — plain stores let the CPU reorder them).
-        slot->in_use.store(false, std::memory_order_release);
+        // A reload in between freed the slot and a new sleep may own it now
+        // (another generation): leave that one alone.
+        if (slot->gen == gen) {
+            slot->coroutine_ref = -1;
+            // release: publishes the coroutine_ref=-1 store above before another
+            // core can observe the slot as free (enforces the ref-then-flag order
+            // the comment above intends — plain stores let the CPU reorder them).
+            slot->in_use.store(false, std::memory_order_release);
+        }
     } else {
         ESP_LOGD(TAG, "resume queue full — re-arming timer for ref %d",
                  slot->coroutine_ref);
@@ -313,6 +439,7 @@ static TimerSlot* slot_acquire(int coroutine_ref) {
         if (!s_timer_pool[i].in_use.load(std::memory_order_acquire)) {
             s_timer_pool[i].in_use.store(true, std::memory_order_relaxed);
             s_timer_pool[i].coroutine_ref = coroutine_ref;
+            s_timer_pool[i].gen = s_gen.load(std::memory_order_relaxed);
             if (!s_timer_pool[i].handle) {
                 const esp_timer_create_args_t args = {
                     .callback         = on_timer_fire,
@@ -347,6 +474,7 @@ extern "C" bool lua_scheduler_push_resume(int coroutine_ref) {
     LuaMsg m = {};
     m.kind                 = MSG_RESUME;
     m.resume.coroutine_ref = coroutine_ref;
+    m.gen                  = s_gen.load(std::memory_order_relaxed);
     bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
@@ -363,6 +491,7 @@ extern "C" bool lua_scheduler_push_run_named(const char* name,
     if (!name) return false;
     LuaMsg m = {};
     m.kind = MSG_RUN_NAMED;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     std::strncpy(m.named.name, name, sizeof(m.named.name) - 1);
     if (args) {
         if (args->value)
@@ -389,6 +518,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
                                            const void* payload_96) {
     LuaMsg m = {};
     m.kind = MSG_EVENT;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     m.event.kind = (LuaEventKind)event_kind;
     if (payload_96) {
         memcpy(m.event.payload, payload_96, 96);
@@ -411,6 +541,7 @@ extern "C" bool lua_scheduler_push_event(uint8_t event_kind,
 extern "C" bool lua_scheduler_push_load_all(void) {
     LuaMsg m = {};
     m.kind = MSG_LOAD_ALL;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
     bool ok = resume_q_send(&m);
     if (!ok) _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
     return ok;
@@ -450,8 +581,10 @@ extern "C" bool lua_scheduler_push_load_all(void) {
 // stays anchored by the fresh ref the yield path (zhac.sleep) took
 // before yielding. `err_ctx` prefixes the error log so each call site
 // keeps its existing message.
+// `script` names the script for script.error when the caller knows it (a load or a named run), else
+// nullptr: Lua's own prefix names it.
 static void resume_and_settle(lua_State* L, lua_State* co, int ref,
-                              int nargs, const char* err_ctx) {
+                              int nargs, const char* err_ctx, const char* script) {
     int nres = 0;
     arm_resume_deadline(co);
     const int status = lua_resume(co, L, nargs, &nres);
@@ -470,6 +603,7 @@ static void resume_and_settle(lua_State* L, lua_State* co, int ref,
         const char* err = lua_tostring(co, -1);
         ESP_LOGE(TAG, "%s: %s", err_ctx, err ? err : "(no message)");
         lua_scheduler_error_bump();
+        report_error(script, err);
     }
     lua_pop(co, (status == LUA_OK) ? nres : 1);
     luaL_unref(L, LUA_REGISTRYINDEX, ref);
@@ -510,7 +644,7 @@ static void resume_coroutine(lua_State* L, const ResumeArgs* r) {
 
     for (int i = 0; i < r->argc; ++i) lua_pushinteger(co, r->argv[i]);
 
-    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error");
+    resume_and_settle(L, co, r->coroutine_ref, r->argc, "coroutine error", nullptr);
 }
 
 // Marshal event fields onto a coroutine's stack. Returns argc.
@@ -674,7 +808,7 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
         // as nargs so Lua hands them to the function. Our spawn ref is
         // settled on every outcome — on yield, zhac.sleep's own ref
         // takes over and the timer slot pushes the resume when ready.
-        resume_and_settle(L, co, ref, argc, "handler error");
+        resume_and_settle(L, co, ref, argc, "handler error", nullptr);
     }
     lua_pop(L, 1);                       // handler table
 }
@@ -685,6 +819,12 @@ static void dispatch_event(lua_State* L, const EventArgs* e) {
 // val_type, int_val, str_val}); fields are zero / "" for non-device
 // triggers. Returns after the coroutine either yields or terminates.
 static void run_named_script(lua_State* L, const RunNamedArgs* r) {
+    // Held by the boot-loop guard: a rule's script.run action (or Run) firing the script that crashed the hub
+    // would crash it again, outside the guard's window, every time the rule fires. Apply ends the hold.
+    if (s_held.load()) {
+        ESP_LOGW(TAG, "script.run '%s' skipped: scripts are held after crashes (Apply starts them)", r->name);
+        return;
+    }
     // Script source scratch lives in PSRAM. Lazy one-shot init. T20:
     // size to LUA_SCRIPT_SRC_MAX (+1 NUL) — the unified store cap — so a
     // legitimately large stored script isn't silently truncated at an 8
@@ -705,6 +845,7 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
     if (luaL_loadbufferx(L, buf, (size_t)n, r->name, "t") != LUA_OK) {
         ESP_LOGE(TAG, "script.run '%s' compile error: %s",
                  r->name, lua_tostring(L, -1));
+        report_error(r->name, lua_tostring(L, -1));
         lua_pop(L, 1);
         return;
     }
@@ -737,7 +878,7 @@ static void run_named_script(lua_State* L, const RunNamedArgs* r) {
 
     char err_ctx[48];   // "lua.run '<name≤31>' error" — worst case 47 + NUL
     snprintf(err_ctx, sizeof(err_ctx), "lua.run '%s' error", r->name);
-    resume_and_settle(L, co, ref, argc, err_ctx);
+    resume_and_settle(L, co, ref, argc, err_ctx, r->name);
 }
 
 // ── Boot-time load-all (MSG_LOAD_ALL) ─────────────────────────────────
@@ -777,6 +918,7 @@ static bool load_one_script(lua_State* L, const char* name) {
     }
     if (luaL_loadbufferx(L, buf, (size_t)n, name, "t") != LUA_OK) {
         ESP_LOGE(TAG, "compile '%s': %s", name, lua_tostring(L, -1));
+        report_error(name, lua_tostring(L, -1));
         lua_pop(L, 1);
         return false;
     }
@@ -804,7 +946,7 @@ static bool load_one_script(lua_State* L, const char* name) {
     // %.24s: cache names are char[25], but the compiler can't see that
     // bound through the const char* param (-Werror=format-truncation).
     snprintf(err_ctx, sizeof(err_ctx), "script '%.24s' error", name);
-    resume_and_settle(L, co, ref, 0, err_ctx);
+    resume_and_settle(L, co, ref, 0, err_ctx, name);
     return true;   // loaded = compiled + started; runtime errors are
                    // logged/counted by resume_and_settle, as before
 }
@@ -812,14 +954,23 @@ static bool load_one_script(lua_State* L, const char* name) {
 // Iterate the SPIFFS script cache, compile + start each entry. A bad
 // script is logged and skipped, NEVER allowed to abort the loop — one
 // broken file must not take the rest down or boot-loop the node.
-static void load_all_scripts(lua_State* L) {
+static void load_all_scripts(lua_State* L, uint16_t* loaded_out, uint16_t* total_out) {
     LuaScriptEntry entries[LUA_SCRIPT_MAX];
     const uint16_t n = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
     uint16_t loaded = 0;
     for (uint16_t i = 0; i < n; ++i) {
+        // The Task 11 ruling: feed the task watchdog between scripts. Each script's compile and first run is
+        // bounded (the CPU budget), sixteen large ones together are not, and where the watchdog panics
+        // (P4 main-core sets trigger_panic) a long boot load was a boot loop.
+        esp_task_wdt_reset();
+        guard_arm(entries[i].name);
         if (load_one_script(L, entries[i].name)) loaded++;
     }
+    guard_arm("");
+    guard_window();
     ESP_LOGI(TAG, "lua scripts loaded: %u/%u", loaded, n);
+    if (loaded_out) *loaded_out = loaded;
+    if (total_out) *total_out = n;
 }
 
 // zhac.on_cron(expr, fn): entries carry a parsed CronExpr (`c`). Checked
@@ -847,7 +998,7 @@ static void cron_tick(lua_State* L) {
                 if (!lua_isfunction(L, -1) || lua_scheduler_at_capacity()) { lua_pop(L, 1); continue; }
                 int ref = LUA_NOREF;
                 lua_State* co = spawn_coroutine(L, &ref);   // consumes fn
-                if (co) resume_and_settle(L, co, ref, 0, "cron handler error");
+                if (co) resume_and_settle(L, co, ref, 0, "cron handler error", nullptr);
             }
         }
     }
@@ -855,8 +1006,71 @@ static void cron_tick(lua_State* L) {
     last = now;
 }
 
+// MSG_RELOAD (spec 2026-10-05 §3.5), on TaskLua — the only task that touches the VM. Rules are not
+// touched; script state (globals, pending zhac.sleep) is lost on purpose; settings a script gave tg_gw stay.
+// noinline: inlined, its LuaScriptEntry array joins task_lua's frame, which every message pays on TaskLua's
+// 8 KB stack (S31, -O2: task_lua 992 B before reload, 1168 B with it inlined, 640 B this way).
+[[gnu::noinline]] static void reload_engine(uint32_t seq) {
+    // 1. Stop every sleep timer and free the pool.
+    for (TimerSlot& s : s_timer_pool) {
+        if (s.handle) esp_timer_stop(s.handle);   // ESP_ERR_INVALID_STATE when it was not armed: fine
+        s.coroutine_ref = -1;
+        s.in_use.store(false, std::memory_order_release);
+    }
+    // 2. A new generation: what the old state queued is dropped as it arrives.
+    s_gen.fetch_add(1, std::memory_order_relaxed);
+    // 3. Close the state; every coroutine goes with it.
+    if (g_L) lua_close(g_L);
+    g_L = nullptr;
+    s_live_coroutines.store(0);
+    _METRIC_VALUE(METRIC_LUA_COROUTINES_LIVE, (int64_t)0);
+    // 4. A fresh state, built as at boot. 5. Every stored script, as at boot; on_boot is not called again.
+    // The Task 7 ruling: the script.error gate starts again too, so a load error after "fix and Apply" is
+    // never swallowed by an event the old text raised a moment before.
+    s_err_gate = LuaErrGate{};
+    ReloadDone done{seq, 0, 0};
+    g_L = lua_engine_new_state(lua_panic_handler);
+    if (g_L) {
+        load_all_scripts(g_L, &done.loaded, &done.total);
+        // A pass that completes ends a hold (the boot-loop guard) and the count of crashes behind it.
+        if (s_held.exchange(false)) ESP_LOGI(TAG, "reload completed: scripts no longer held");
+        s_guard_crashes = lua_guard_count(0, false, false);   // a count of 0
+    } else {
+        LuaScriptEntry entries[LUA_SCRIPT_MAX];
+        done.total = lua_script_cache_list(entries, LUA_SCRIPT_MAX);
+        ESP_LOGE(TAG, "reload: no new Lua state (out of memory?) -- scripts stay off until the next reload");
+    }
+    ESP_LOGI(TAG, "lua reload: %u/%u scripts started", done.loaded, done.total);
+    if (s_reload_done) xQueueOverwrite(s_reload_done, &done);
+}
+
+extern "C" LuaReloadResult lua_engine_reload(uint32_t wait_ms, uint16_t* loaded, uint16_t* total) {
+    if (!s_resume_q || !s_reload_done) return LUA_RELOAD_BUSY;
+    LuaMsg m = {};
+    m.kind = MSG_RELOAD;
+    m.gen  = s_gen.load(std::memory_order_relaxed);
+    m.reload.seq = s_reload_seq.fetch_add(1) + 1;
+    if (xQueueSend(s_resume_q, &m, 0) != pdTRUE) {
+        _METRIC_COUNTER_INC(METRIC_LUA_QUEUE_DROPS_TOTAL, 1);
+        return LUA_RELOAD_BUSY;
+    }
+    // ponytail: two callers reloading at once share the 1-item result queue; one of them may miss its
+    // result and answer "queued" while the pass still completes. A per-call result slot if that matters.
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t span  = pdMS_TO_TICKS(wait_ms);
+    ReloadDone d{};
+    for (;;) {
+        const TickType_t spent = xTaskGetTickCount() - start;
+        if (spent >= span || xQueueReceive(s_reload_done, &d, span - spent) != pdTRUE) return LUA_RELOAD_QUEUED;
+        if (d.seq == m.reload.seq) break;   // an earlier, abandoned call's result: drop it, keep waiting
+    }
+    if (loaded) *loaded = d.loaded;
+    if (total) *total = d.total;
+    return LUA_RELOAD_DONE;
+}
+
 static void task_lua(void* arg) {
-    lua_State* L = (lua_State*)arg;
+    (void)arg;   // the state is g_L, which a reload replaces
     ESP_LOGI(TAG, "TaskLua started");
     // T20: real watchdog coverage. esp_task_wdt_add(NULL) subscribes
     // THIS task; the loop resets it every iteration. The receive timeout
@@ -872,7 +1086,9 @@ static void task_lua(void* arg) {
         // looking wedged. main.cpp subscribes TaskLua to the TWDT.
         esp_task_wdt_reset();
         // 1 s so zhac.on_cron gets second resolution (also pets the WDT).
-        const bool got = xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
+        // volatile: `got` is read after the setjmp below; without it the Xtensa GCC (ESP32-S3, mono-core)
+        // stops on -Werror=clobbered.
+        const volatile bool got = xQueueReceive(s_resume_q, &m, pdMS_TO_TICKS(1000)) == pdTRUE;
 
         // T20 (panic backstop): wrap every VM-touching dispatch step in a
         // setjmp frame so an unprotected OOM/internal raise (e.g. inside
@@ -886,26 +1102,32 @@ static void task_lua(void* arg) {
             // CODEX M-03: the longjmp skipped resume_and_settle. Reclaim any
             // coroutine still in flight so its registry ref + live-count slot
             // don't leak (a repeated raise would otherwise exhaust the pool).
-            if (s_inflight.ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, s_inflight.ref);
-            if (s_inflight.counted)          lua_scheduler_coroutine_exit();
+            if (g_L && s_inflight.ref != LUA_NOREF) luaL_unref(g_L, LUA_REGISTRYINDEX, s_inflight.ref);
+            if (s_inflight.counted)                 lua_scheduler_coroutine_exit();
             s_inflight = {};
             continue;
         }
         s_panic_armed = true;
         s_inflight = {};   // CODEX M-03: clean slate for this dispatch step
 
-        cron_tick(L);
+        lua_State* L = g_L;   // read every step: MSG_RELOAD replaces it (NULL after a reload that failed)
+        if (L) cron_tick(L);
+        report_held();
         if (!got) { s_panic_armed = false; continue; }
 
-        if (m.kind == MSG_RESUME) {
-            resume_coroutine(L, &m.resume);
-        } else if (m.kind == MSG_EVENT) {
-            dispatch_event(L, &m.event);
-        } else if (m.kind == MSG_RUN_NAMED) {
-            run_named_script(L, &m.named);
-        } else if (m.kind == MSG_LOAD_ALL) {
-            load_all_scripts(L);
-        }
+        if (m.kind == MSG_RELOAD) {
+            reload_engine(m.reload.seq);
+        } else if (L && m.gen == s_gen.load(std::memory_order_relaxed)) {
+            if (m.kind == MSG_RESUME) {
+                resume_coroutine(L, &m.resume);
+            } else if (m.kind == MSG_EVENT) {
+                dispatch_event(L, &m.event);
+            } else if (m.kind == MSG_RUN_NAMED) {
+                run_named_script(L, &m.named);
+            } else if (m.kind == MSG_LOAD_ALL) {
+                load_all_scripts(L, nullptr, nullptr);
+            }
+        }   // else: the old state's message (a reload came after it), or no engine: dropped
 
         s_panic_armed = false;
     }
@@ -934,10 +1156,18 @@ extern "C" int lua_scheduler_spawn(lua_State* L) {
 }
 
 extern "C" bool lua_engine_scheduler_start(lua_State* L) {
+    guard_boot_check();   // before TaskLua exists: nothing has armed the guard on this boot yet
     s_resume_q = zhac_queue_create(CONFIG_LUA_ENGINE_RESUME_QUEUE_DEPTH,
                                sizeof(LuaMsg));
     if (!s_resume_q) {
         ESP_LOGE(TAG, "resume queue create failed");
+        return false;
+    }
+    s_reload_done = xQueueCreate(1, sizeof(ReloadDone));
+    if (!s_reload_done) {
+        ESP_LOGE(TAG, "reload queue create failed");
+        zhac_queue_delete(s_resume_q);
+        s_resume_q = NULL;
         return false;
     }
 
@@ -955,6 +1185,8 @@ extern "C" bool lua_engine_scheduler_start(lua_State* L) {
         ESP_LOGE(TAG, "TaskLua create failed");
         zhac_queue_delete(s_resume_q);
         s_resume_q = NULL;
+        vQueueDelete(s_reload_done);   // plain xQueueCreate above, so a plain delete
+        s_reload_done = NULL;
         return false;
     }
     return true;
