@@ -45,6 +45,12 @@ uint32_t lua_scheduler_yield_count(void);
 void     lua_scheduler_error_bump(void);
 void     lua_scheduler_yield_bump(void);
 
+// LU-02: true while the current resume is past its CPU deadline (the runaway
+// hook is raising the budget error). The sandbox's pcall/xpcall rethrow a
+// caught error while this holds, so a script cannot swallow the kill and keep
+// running. False in normal operation, so ordinary pcall is unaffected.
+bool     lua_scheduler_resume_over_budget(void);
+
 #ifdef __cplusplus
 }
 #endif

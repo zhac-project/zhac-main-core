@@ -29,6 +29,43 @@ static void redact(lua_State* L, const char* tbl, const char* name) {
     lua_pop(L, 1);
 }
 
+// ── LU-02: pcall / xpcall that cannot swallow the CPU-runaway kill ─────
+// The scheduler's count hook raises a Lua error once a resume passes its CPU
+// deadline (lua_scheduler.cpp). A plain pcall/xpcall catches that error, so a
+// tight loop wrapped in pcall keeps catching the raise and never returns —
+// defeating the guard and wedging TaskLua. These replacements behave exactly
+// like the stock base-lib ones (same stack handling, same multi-return, still
+// yieldable via lua_pcallk so `zhac.sleep` inside a pcall works) EXCEPT that,
+// once the resume is over budget, the caught error is re-raised instead of
+// returned — so the kill propagates out of every protected frame to the
+// scheduler, whatever pcall/xpcall nesting the script used. Ordinary errors
+// (the common, sub-deadline case) are caught as before.
+static int sandbox_finish_pcall(lua_State* L, int status, lua_KContext extra) {
+    if (status != LUA_OK && status != LUA_YIELD) {   // error?
+        if (lua_scheduler_resume_over_budget()) return lua_error(L);   // re-raise: the kill is uncatchable
+        lua_pushboolean(L, 0);   // first result (false)
+        lua_pushvalue(L, -2);    // error object
+        return 2;
+    }
+    return lua_gettop(L) - (int)extra;   // all results (true already in place)
+}
+static int sandboxed_pcall(lua_State* L) {
+    luaL_checkany(L, 1);
+    lua_pushboolean(L, 1);   // first result if no error
+    lua_insert(L, 1);
+    int status = lua_pcallk(L, lua_gettop(L) - 2, LUA_MULTRET, 0, 0, sandbox_finish_pcall);
+    return sandbox_finish_pcall(L, status, 0);
+}
+static int sandboxed_xpcall(lua_State* L) {
+    int n = lua_gettop(L);
+    luaL_checktype(L, 2, LUA_TFUNCTION);   // message handler
+    lua_pushboolean(L, 1);
+    lua_pushvalue(L, 1);
+    lua_rotate(L, 3, 2);
+    int status = lua_pcallk(L, n - 2, LUA_MULTRET, 2, 2, sandbox_finish_pcall);
+    return sandbox_finish_pcall(L, status, 2);
+}
+
 // `print(...)` → ESP_LOGI("lua", "...")
 static int sandboxed_print(lua_State* L) {
     const int n = lua_gettop(L);
@@ -134,6 +171,15 @@ bool lua_engine_sandbox_apply(lua_State* L) {
     // Redirect print.
     lua_pushcfunction(L, sandboxed_print);
     lua_setglobal(L, "print");
+
+    // LU-02: replace pcall/xpcall with kill-aware versions so a pcall-wrapped
+    // runaway loop can't catch the CPU-deadline error and keep running. Done
+    // after luaL_openlibs installed the originals; the C API (the engine's own
+    // lua_pcall) and the redacted coroutine.create/wrap are unaffected.
+    lua_pushcfunction(L, sandboxed_pcall);
+    lua_setglobal(L, "pcall");
+    lua_pushcfunction(L, sandboxed_xpcall);
+    lua_setglobal(L, "xpcall");
 
     // LUA-F10: lock stdlib table metatables. Defense in depth — every
     // public Lua sandbox CVE chain starts with metatable manipulation
