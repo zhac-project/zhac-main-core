@@ -14,8 +14,15 @@
 // Fails on the pre-fix scheduler: the bare-yield path skipped
 // lua_scheduler_coroutine_exit(), so the count stayed elevated.
 //
+// It also covers LU-02's scheduler half (cases D/E): the real runaway hook must
+// set the over-budget flag the sandbox's pcall/xpcall read (the real
+// lua_sandbox.c is linked too), arm_resume_deadline must clear it, and under the
+// real hook a pcall-wrapped runaway is killed rather than caught.
+// test_runaway.cpp covers the sandbox half with a stand-in flag.
+//
 // Run with PATH=/usr/bin first if ESP-IDF is active (its `as` breaks g++).
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 
 // The whole scheduler TU — brings in its statics (resume_and_settle, ...).
@@ -29,7 +36,12 @@ extern "C" size_t   lua_engine_heap_peak_bytes(void) { return 0; }
 extern "C" lua_State* lua_engine_new_state(lua_CFunction) { return nullptr; }
 extern "C" uint16_t lua_script_cache_list(LuaScriptEntry*, uint16_t) { return 0; }
 extern "C" int      lua_script_cache_read(const char*, char*, size_t) { return -1; }
-int64_t esp_timer_get_time(void) { return 0; }          // deadlines never fire for short yields
+// A real monotonic clock: the LU-01 yields finish far inside the 50 ms budget,
+// while cases D/E run a resume past it so the real hook fires.
+int64_t esp_timer_get_time(void) {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
 esp_reset_reason_t esp_reset_reason(void) { return ESP_RST_POWERON; }
 bool cron_matches(const CronExpr&, time_t) { return false; }
 
@@ -82,6 +94,36 @@ int main() {
     assert(lua_scheduler_live_count() == base3);            // FAILS pre-fix (base3 + 100)
     std::printf("  ok: 100 bare yields leave the live count flat (%u)\n",
                 (unsigned)lua_scheduler_live_count());
+
+    // D (LU-02, real hook): a resume driven past LUA_RESUME_DEADLINE_US sets the
+    // over-budget flag the sandbox's pcall/xpcall read; arm_resume_deadline,
+    // which every resume starts with, clears it again.
+    lua_State* L2 = luaL_newstate();
+    assert(L2);
+    luaL_openlibs(L2);
+    assert(lua_engine_sandbox_apply(L2));                  // the real kill-aware pcall/xpcall
+    assert(!lua_scheduler_resume_over_budget());
+    const uint16_t base4 = lua_scheduler_live_count();
+    spawn_and_settle(L2, "while true do end", "runaway"); // the real hook raises at the deadline
+    assert(lua_scheduler_resume_over_budget());            // FAILS if the hook stops setting it
+    assert(lua_scheduler_live_count() == base4);           // the killed coroutine was settled
+    lua_State* t = lua_newthread(L2);
+    arm_resume_deadline(t);
+    lua_pop(L2, 1);
+    assert(!lua_scheduler_resume_over_budget());           // FAILS if arm stops clearing it
+    std::printf("  ok: the real hook sets the over-budget flag; arm_resume_deadline clears it\n");
+
+    // E (LU-02, end to end): under the real hook a pcall-wrapped runaway is
+    // killed, not caught — the statement after the pcall never runs.
+    const uint32_t errs = lua_scheduler_error_count();
+    spawn_and_settle(L2, "pcall(function() while true do end end) caught = true", "pcall-runaway");
+    lua_getglobal(L2, "caught");
+    assert(lua_isnil(L2, -1));                             // FAILS if the pcall swallowed the kill
+    lua_pop(L2, 1);
+    assert(lua_scheduler_error_count() == errs + 1);       // the resume ended in the kill
+    assert(lua_scheduler_live_count() == base4);
+    std::printf("  ok: a pcall-wrapped runaway under the real hook is killed, not caught\n");
+    lua_close(L2);
 
     lua_close(g_L);
     std::printf("lua_coro_leak_tests: ok\n");
