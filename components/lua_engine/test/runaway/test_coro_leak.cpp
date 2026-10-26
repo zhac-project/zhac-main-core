@@ -125,6 +125,26 @@ int main() {
     std::printf("  ok: a pcall-wrapped runaway under the real hook is killed, not caught\n");
     lua_close(L2);
 
+    // F (LU-05): MQTT and raw-frame strings reach Lua bounded by their fields. A producer that fills a
+    // field to its end, with no NUL, must not make the push read on into the next field or past the event.
+    {
+        struct { EventArgs e; char after[8]; } b;
+        std::memset(&b, 'x', sizeof(b));
+        b.after[sizeof(b.after) - 1] = '\0';
+        size_t n = 0;
+        b.e.kind = LUA_EVT_MQTT;
+        assert(push_event_args(g_L, &b.e) == 2);
+        lua_tolstring(g_L, -2, &n); assert(n == sizeof(MqttMsgEvent::topic));     // FAILS pre-fix (103)
+        lua_tolstring(g_L, -1, &n); assert(n == sizeof(MqttMsgEvent::payload));   // FAILS pre-fix (39)
+        lua_pop(g_L, 2);
+        b.e.kind = LUA_EVT_RAW;
+        assert(push_event_args(g_L, &b.e) == 1);
+        lua_getfield(g_L, -1, "hex");
+        lua_tolstring(g_L, -1, &n); assert(n == sizeof(ZclRawEvent::payload_hex)); // FAILS pre-fix (87)
+        lua_pop(g_L, 2);
+        std::printf("  ok: MQTT topic/payload and raw hex are bounded by their fields\n");
+    }
+
     lua_close(g_L);
     std::printf("lua_coro_leak_tests: ok\n");
     return 0;

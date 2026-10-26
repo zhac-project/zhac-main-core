@@ -723,11 +723,12 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             return 5;
         }
         case LUA_EVT_MQTT: {
-            // MqttMsgEvent: topic[64], payload[32].
-            const char* topic   = (const char*)(e->payload + 0);
-            const char* payload = (const char*)(e->payload + 64);
-            lua_pushstring(co, topic);
-            lua_pushstring(co, payload);
+            // MqttMsgEvent: topic[64], payload[32]. Bounded by the field, as the ATTR path above: a
+            // producer that fills a field to its end must not make the push read on (review LU-05).
+            const char* topic   = (const char*)(e->payload + offsetof(MqttMsgEvent, topic));
+            const char* payload = (const char*)(e->payload + offsetof(MqttMsgEvent, payload));
+            lua_pushlstring(co, topic,   strnlen(topic,   sizeof(MqttMsgEvent::topic)));
+            lua_pushlstring(co, payload, strnlen(payload, sizeof(MqttMsgEvent::payload)));
             return 2;
         }
         case LUA_EVT_RAW: {
@@ -754,7 +755,8 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_pushinteger(co, cluster);   lua_setfield(co, -2, "cluster");
             lua_pushinteger(co, command);   lua_setfield(co, -2, "command");
             lua_pushinteger(co, plen);      lua_setfield(co, -2, "len");
-            lua_pushstring(co, hex);        lua_setfield(co, -2, "hex");
+            lua_pushlstring(co, hex, strnlen(hex, sizeof(ZclRawEvent::payload_hex)));
+            lua_setfield(co, -2, "hex");
             return 1;
         }
     }
