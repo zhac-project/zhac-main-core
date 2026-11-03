@@ -3,7 +3,7 @@
 // lua_script_cache.cpp — SPIFFS-backed storage for Lua scripts at
 // `/scripts/<name>.lua`. Partition label: `scripts`.
 //
-// Mount is lazy + idempotent (first call formats-if-empty), so the
+// Mount is lazy + idempotent (first call formats an erased partition), so the
 // engine + HAP handlers don't need an explicit mount step. Writes use
 // tmp + rename for atomicity; reads/deletes/list go through the VFS.
 
@@ -18,7 +18,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <memory>
+#include <new>
+
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_spiffs.h"
 
 #include "lua_engine_scripts.h"
@@ -118,16 +122,36 @@ void recover_interrupted_saves() {
     }
 }
 
+// An erased partition (all 0xFF): the hub's first use, the only case in which
+// a failed mount is answered by formatting (review 2026-10-24 PB-01). Anything
+// else holds the owner's scripts in a state SPIFFS cannot read: kept as is.
+bool partition_blank() {
+    const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                        ESP_PARTITION_SUBTYPE_DATA_SPIFFS, PARTITION_LABEL);
+    std::unique_ptr<uint32_t[]> buf(new (std::nothrow) uint32_t[256]);
+    if (!p || !buf) return false;
+    for (size_t off = 0; off < p->size; off += 1024) {
+        if (esp_partition_read(p, off, buf.get(), 1024) != ESP_OK) return false;
+        for (size_t i = 0; i < 256; i++) if (buf[i] != 0xFFFFFFFFu) return false;
+    }
+    return true;
+}
+
 bool ensure_mounted() {
     static bool mounted = false;
     if (mounted) return true;
-    const esp_vfs_spiffs_conf_t conf = {
+    esp_vfs_spiffs_conf_t conf = {
         .base_path              = BASE_PATH,
         .partition_label        = PARTITION_LABEL,
         .max_files              = 8,
-        .format_if_mount_failed = true,
+        .format_if_mount_failed = false,
     };
-    const esp_err_t e = esp_vfs_spiffs_register(&conf);
+    esp_err_t e = esp_vfs_spiffs_register(&conf);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE && partition_blank()) {
+        ESP_LOGI(TAG, "'%s' is empty -- formatting it", PARTITION_LABEL);
+        conf.format_if_mount_failed = true;
+        e = esp_vfs_spiffs_register(&conf);
+    }
     if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "mount '%s' failed: %s",
                  PARTITION_LABEL, esp_err_to_name(e));

@@ -215,10 +215,21 @@ static constexpr int     LUA_RESUME_HOOK_COUNT  = 1000;
 static int64_t           s_resume_deadline_us   = 0;
 static int64_t           s_resume_hard_us       = 0;
 static bool              s_resume_killed        = false;
+// LU-02: set the moment a resume first passes its CPU deadline (the hook starts
+// raising the budget error). pcall/xpcall (lua_sandbox.c) read it and refuse to
+// let a script swallow that error — a tight loop wrapped in pcall must not be
+// able to catch the runaway kill and keep running. Reset per resume.
+static bool              s_resume_over_budget   = false;
+// LU-01: did zhac.sleep arm a timer slot during the current resume? A sleep
+// hands its coroutine's live-count slot to the timer continuation; a bare
+// coroutine.yield() does not, so the yield path must balance the count itself
+// (see resume_and_settle) or it leaks a slot of CONFIG_LUA_ENGINE_MAX_COROUTINES.
+static bool              s_sleep_armed          = false;
 
 static void lua_resume_count_hook(lua_State* L, lua_Debug*) {
     const int64_t now = esp_timer_get_time();
     if (now < s_resume_deadline_us) return;
+    s_resume_over_budget = true;   // LU-02: kill in flight — pcall/xpcall must not swallow it
     if (!s_resume_killed && now >= s_resume_hard_us) {
         // Escalate: fire every instruction and keep raising. Not resetting
         // the deadline means a pcall that catches the error can no longer
@@ -240,6 +251,8 @@ static void arm_resume_deadline(lua_State* co) {
     s_resume_deadline_us = now + LUA_RESUME_DEADLINE_US;
     s_resume_hard_us     = now + LUA_RESUME_HARD_US;
     s_resume_killed      = false;
+    s_resume_over_budget = false;   // LU-02
+    s_sleep_armed        = false;   // LU-01
     lua_sethook(co, lua_resume_count_hook,
                 LUA_MASKCOUNT, LUA_RESUME_HOOK_COUNT);
 }
@@ -368,6 +381,11 @@ extern "C" void lua_scheduler_coroutine_exit(void)  {
     _METRIC_VALUE(METRIC_LUA_HEAP_PEAK_BYTES, (int64_t)lua_engine_heap_peak_bytes());
 }
 
+// LU-02: the sandbox's pcall/xpcall query this to decide whether a caught error
+// is the CPU-runaway kill that must be re-raised rather than returned. TaskLua
+// reads it (hook + pcall both run there), so a plain bool is enough.
+extern "C" bool lua_scheduler_resume_over_budget(void) { return s_resume_over_budget; }
+
 extern "C" uint16_t lua_scheduler_live_count(void)  { return (uint16_t)s_live_coroutines.load(); }
 extern "C" uint32_t lua_scheduler_error_count(void) { return (uint32_t)s_error_count.load(); }
 extern "C" uint32_t lua_scheduler_yield_count(void) { return (uint32_t)s_yield_count.load(); }
@@ -465,6 +483,10 @@ extern "C" bool lua_scheduler_sleep(int coroutine_ref, uint32_t delay_ms) {
     TimerSlot* s = slot_acquire(coroutine_ref);
     if (!s) return false;
     esp_timer_start_once(s->handle, (uint64_t)delay_ms * 1000ULL);
+    // LU-01: a continuation (this timer slot, holding its own fresh ref) now
+    // owns the coroutine's live-count slot, so resume_and_settle must NOT exit
+    // it on the yield that follows. A bare coroutine.yield() never reaches here.
+    s_sleep_armed = true;
     return true;
 }
 
@@ -596,7 +618,14 @@ static void resume_and_settle(lua_State* L, lua_State* co, int ref,
         // ours is redundant — dropping it is what keeps the registry
         // at one slot per suspended coroutine.
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
-        s_inflight = {};   // CODEX M-03: settled — count now owned by the timer slot
+        // LU-01: that continuation also took over this coroutine's live-count
+        // slot — but ONLY if zhac.sleep actually armed a timer this resume. A
+        // bare coroutine.yield() (no sleep) arms nothing: the thread is now
+        // orphaned (GC-able, never resumed), so its live-count slot must be
+        // released here or it leaks until the next reload. Without this, 64
+        // such yields silently wedge the whole engine (at_capacity() forever).
+        if (!s_sleep_armed) lua_scheduler_coroutine_exit();
+        s_inflight = {};   // CODEX M-03: settled — count owned by the timer slot, or exited above
         return;
     }
     if (status != LUA_OK) {
@@ -694,11 +723,12 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             return 5;
         }
         case LUA_EVT_MQTT: {
-            // MqttMsgEvent: topic[64], payload[32].
-            const char* topic   = (const char*)(e->payload + 0);
-            const char* payload = (const char*)(e->payload + 64);
-            lua_pushstring(co, topic);
-            lua_pushstring(co, payload);
+            // MqttMsgEvent: topic[64], payload[32]. Bounded by the field, as the ATTR path above: a
+            // producer that fills a field to its end must not make the push read on (review LU-05).
+            const char* topic   = (const char*)(e->payload + offsetof(MqttMsgEvent, topic));
+            const char* payload = (const char*)(e->payload + offsetof(MqttMsgEvent, payload));
+            lua_pushlstring(co, topic,   strnlen(topic,   sizeof(MqttMsgEvent::topic)));
+            lua_pushlstring(co, payload, strnlen(payload, sizeof(MqttMsgEvent::payload)));
             return 2;
         }
         case LUA_EVT_RAW: {
@@ -725,7 +755,8 @@ static int push_event_args(lua_State* co, const EventArgs* e) {
             lua_pushinteger(co, cluster);   lua_setfield(co, -2, "cluster");
             lua_pushinteger(co, command);   lua_setfield(co, -2, "command");
             lua_pushinteger(co, plen);      lua_setfield(co, -2, "len");
-            lua_pushstring(co, hex);        lua_setfield(co, -2, "hex");
+            lua_pushlstring(co, hex, strnlen(hex, sizeof(ZclRawEvent::payload_hex)));
+            lua_setfield(co, -2, "hex");
             return 1;
         }
     }
