@@ -7,6 +7,10 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ## [Unreleased]
 
+### Deprecated
+
+- **The two-chip firmware** (this ESP32-P4 build with the ESP32-S3 `zhac-net-core`, joined by HAP over SPI) is no longer developed, built or tested. `main/`, `components/hap_slave` and the unused `components/ezsp_driver` and `components/ezsp_backend` are frozen. The hub is `zhac-wired-core`, which gets Wi-Fi from an ESP32-C5 co-processor through ESP-Hosted. `components/lua_engine` and `components/lua_cjson` (compiled by zhac-wired-core and zhac-mono-core) and `components/zigbee_backend` (used by zhac-mono-core) are still maintained here.
+
 ### Added
 
 - **`lua_engine_set_error_hook(fn(name, line, message))`** (`lua_engine`, spec 2026-10-05 §3.6): called on TaskLua where script errors are logged (compile at load, reload or run; an error while running), with the script's name and line from Lua's `[string "<name>"]:<line>:` prefix and the text cut to 120 bytes on a character boundary; at most once per script per 10 s. The wired firmware turns it into the `script.error` event. Pure parts in `include/lua_engine_err.h`, host test `test/host/lua_err_test.cpp`.

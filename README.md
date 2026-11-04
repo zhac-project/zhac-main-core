@@ -1,5 +1,19 @@
 # zhac-main-core
 
+> **Deprecated (2026-11-04).** The two-chip build (this ESP32-P4 firmware
+> plus the ESP32-S3 `zhac-net-core`, joined by HAP over SPI) is no longer
+> developed, built or tested, and never shipped. The ZHAC hub is
+> [zhac-wired-core]; it gets Wi-Fi from an ESP32-C5 co-processor through
+> ESP-Hosted. Do not build `main/` or `components/hap_slave`.
+>
+> The repository stays because other firmware builds from it:
+> zhac-wired-core and zhac-mono-core compile the Lua engine
+> (`components/lua_engine`, `components/lua_cjson`), and zhac-mono-core
+> also uses `components/zigbee_backend`. Changes to those components are
+> still made here and must keep those builds green.
+
+[zhac-wired-core]: https://github.com/zhac-project/zhac-wired-core
+
 ESP32-P4 firmware for [ZHAC]. Runs the Zigbee coordinator, Lua script
 engine, and rule scheduler. Communicates with the S3 network core
 over SPI via the custom HAP binary protocol.
