@@ -62,6 +62,11 @@ bool lua_engine_check_syntax(const char* name, const char* src,
 typedef void (*LuaErrorHook)(const char* name, int line, const char* message);
 void lua_engine_set_error_hook(LuaErrorHook hook);
 
+// More zhac.* functions, added by a firmware root (wired-core: the hub pins).
+// Call before lua_engine_init; `fns` is a NULL-terminated static list.
+struct luaL_Reg;
+void lua_engine_set_zhac_extension(const struct luaL_Reg* fns);
+
 // script.reload (spec 2026-10-05 §3.5): on TaskLua, stops every sleep timer, drops the old state's queued
 // resumes, events and runs, closes the Lua state, opens a fresh one as lua_engine_init does (no new task,
 // queue, event bridge or rules hook) and loads every stored script as at boot -- on_boot handlers are not

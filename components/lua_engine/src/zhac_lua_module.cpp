@@ -309,8 +309,12 @@ static const luaL_Reg kZhacLib[] = {
     {NULL, NULL},
 };
 
+static const luaL_Reg* s_zhac_ext = nullptr;
+extern "C" void lua_engine_set_zhac_extension(const luaL_Reg* fns) { s_zhac_ext = fns; }
+
 extern "C" int luaopen_zhac(lua_State* L) {
     luaL_newlib(L, kZhacLib);
+    if (s_zhac_ext) luaL_setfuncs(L, s_zhac_ext, 0);
     return 1;
 }
 
