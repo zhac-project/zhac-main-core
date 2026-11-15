@@ -13,6 +13,8 @@ the platform-wide `vYYYYMMDDVV` scheme tagged from `zhac-platform`.
 
 ### Added
 
+- **`lua_engine_set_zhac_extension()`** (`lua_engine`): a firmware adds its own functions to the Lua `zhac` table (zhac-wired-core: the hub pin functions `zhac.gpio_write` & co.). Call before `lua_engine_init()`.
+
 - **`lua_engine_set_error_hook(fn(name, line, message))`** (`lua_engine`, spec 2026-10-05 §3.6): called on TaskLua where script errors are logged (compile at load, reload or run; an error while running), with the script's name and line from Lua's `[string "<name>"]:<line>:` prefix and the text cut to 120 bytes on a character boundary; at most once per script per 10 s. The wired firmware turns it into the `script.error` event. Pure parts in `include/lua_engine_err.h`, host test `test/host/lua_err_test.cpp`.
 - **`lua_engine_reload(wait_ms, &loaded, &total)`** (`lua_engine`, spec 2026-10-05 §3.5): restarts the Lua engine without a reboot -- on TaskLua it stops every sleep timer, drops the old state's queued resumes, events and runs (a generation number on messages and timer slots), closes the state, opens a fresh one as at boot and loads every stored script (on_boot is not called again). Waits up to `wait_ms` (`LUA_RELOAD_DONE`), else `LUA_RELOAD_QUEUED`. `LuaScriptEntry` gains `mtime`.
 
