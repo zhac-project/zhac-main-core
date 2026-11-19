@@ -6,11 +6,13 @@
 > [zhac-wired-core]; it gets Wi-Fi from an ESP32-C5 co-processor through
 > ESP-Hosted. Do not build `main/` or `components/hap_slave`.
 >
-> The repository stays because other firmware builds from it:
-> zhac-wired-core and zhac-mono-core compile the Lua engine
-> (`components/lua_engine`, `components/lua_cjson`), and zhac-mono-core
-> also uses `components/zigbee_backend`. Changes to those components are
-> still made here and must keep those builds green.
+> **Archived (November 2026).** `components/lua_engine` and
+> `components/lua_cjson` moved, with their history and the Lua fixes made
+> after this repo's last commit, to [zhac-components], where
+> zhac-wired-core builds them. Bugs and questions:
+> [zhac-docs issues](https://github.com/zhac-project/zhac-docs/issues/new/choose).
+
+[zhac-components]: https://github.com/zhac-project/zhac-components
 
 [zhac-wired-core]: https://github.com/zhac-project/zhac-wired-core
 
